@@ -1,0 +1,6 @@
+requests>=2.31
+# Pinned below 4.0: PuLP 4 removes LpVariable.dicts and PULP_CBC_CMD, both of
+# which optimizer.py uses. Upgrading requires migrating to the add_variable API.
+pulp>=3.0,<4.0
+pandas>=2.0
+rich>=13.0
