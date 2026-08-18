@@ -43,6 +43,141 @@ class TestFixtureMultiplier(unittest.TestCase):
                            scoring.fixture_multiplier(1, 4))
 
 
+class TestPeakMinutes(unittest.TestCase):
+    """A wrecked recent season must not erase proven capability."""
+
+    def _rates(self, minutes_by_season_oldest_first):
+        summary = {"history_past": [
+            {"minutes": m, "total_points": 0, "starts": 0}
+            for m in minutes_by_season_oldest_first
+        ]}
+        return scoring.historical_rates(summary)
+
+    def test_peak_survives_a_blank_recent_season(self):
+        """Three full seasons then an injury year: project on the three."""
+        rates = self._rates([3000, 3000, 3000, 100])
+        self.assertGreater(rates.peak_minutes_per_game(), 40.0)
+
+    def test_peak_decays_with_age(self):
+        recent_peak = self._rates([0, 0, 3000]).peak_minutes_per_game()
+        old_peak = self._rates([3000, 0, 0]).peak_minutes_per_game()
+        self.assertGreater(recent_peak, old_peak)
+
+    def test_peak_is_discounted_below_the_raw_level(self):
+        """We never project a past peak forward at full value."""
+        rates = self._rates([3420])           # every minute of a season
+        self.assertLess(rates.peak_minutes_per_game(), 3420 / 38)
+
+    def test_no_history_means_no_peak(self):
+        self.assertEqual(scoring.historical_rates(None).peak_minutes_per_game(), 0.0)
+
+    def test_zero_seasons_are_recorded_not_skipped(self):
+        """A season sat out is information; dropping it would inflate the mean."""
+        rates = self._rates([3000, 0])
+        self.assertEqual(len(rates.minutes_per_game), 2)
+        self.assertEqual(rates.minutes_per_game[0], 0.0)   # most recent first
+
+
+class TestNewSignings(unittest.TestCase):
+    """Minutes earned at a previous club are weaker evidence."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bootstrap = data.get_bootstrap()
+        cls.fixtures = data.get_fixtures()
+        players = data.player_lookup(cls.bootstrap)
+        summaries = data.get_all_element_summaries(list(players))
+        cls.scorer = scoring.BayesianRateScorer(
+            cls.bootstrap, cls.fixtures, summaries)
+
+    def test_recent_join_date_is_detected(self):
+        self.assertTrue(self.scorer._is_new_signing({"team_join_date": "2026-07-15"}))
+        self.assertFalse(self.scorer._is_new_signing({"team_join_date": "2023-08-01"}))
+        self.assertFalse(self.scorer._is_new_signing({}))
+
+    def test_new_signing_status_changes_the_estimate(self):
+        """Join date must actually feed through to projected minutes."""
+        candidate = next(
+            dict(p) for p in self.bootstrap["elements"]
+            if float(p["selected_by_percent"] or 0) < 3.0 and p["now_cost"] >= 55
+        )
+        settled = dict(candidate, team_join_date="2022-07-01")
+        moved = dict(candidate, team_join_date="2026-07-01")
+        self.assertNotAlmostEqual(self.scorer._expected_minutes(moved),
+                                  self.scorer._expected_minutes(settled))
+
+    def test_a_proven_starter_who_moves_is_projected_down(self):
+        """Minutes earned elsewhere are real but weaker evidence.
+
+        Widening shrinkage pulls the estimate toward the price-implied prior,
+        so a player who was near ever-present at a previous club loses some of
+        that certainty on arrival.
+        """
+        proven = None
+        for player in self.bootstrap["elements"]:
+            rates = scoring.historical_rates(self.scorer.summaries.get(player["id"]))
+            if rates.weighted_games <= 0:
+                continue
+            observed = rates.weighted_minutes / rates.weighted_games
+            if observed > 80 and float(player["selected_by_percent"] or 0) < 5:
+                proven = player
+                break
+        self.assertIsNotNone(proven, "no near-ever-present low-owned player found")
+
+        settled = dict(proven, team_join_date="2021-07-01")
+        moved = dict(proven, team_join_date="2026-07-01")
+        self.assertLess(self.scorer._expected_minutes(moved),
+                        self.scorer._expected_minutes(settled))
+
+    def test_the_league_actually_contains_new_signings(self):
+        """Guards against the cutoff silently matching nobody."""
+        new = [p for p in self.bootstrap["elements"]
+               if self.scorer._is_new_signing(p)]
+        self.assertGreater(len(new), 10)
+
+
+class TestOwnershipIsPriceAware(unittest.TestCase):
+    """Ownership means different things at different price points."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bootstrap = data.get_bootstrap()
+        cls.fixtures = data.get_fixtures()
+        players = data.player_lookup(cls.bootstrap)
+        summaries = data.get_all_element_summaries(list(players))
+        cls.scorer = scoring.BayesianRateScorer(
+            cls.bootstrap, cls.fixtures, summaries)
+
+    def test_minimum_priced_players_get_no_ownership_boost(self):
+        """A heavily-owned cheap keeper is bench fodder, not a nailed starter."""
+        cheapest = min((p for p in self.bootstrap["elements"]
+                        if p["element_type"] == 1),
+                       key=lambda p: p["now_cost"])
+        self.assertEqual(self.scorer._ownership_confidence(cheapest), 0.0)
+
+    def test_premium_players_get_the_full_ownership_signal(self):
+        premium = max(self.bootstrap["elements"], key=lambda p: p["now_cost"])
+        self.assertEqual(self.scorer._ownership_confidence(premium), 1.0)
+
+    def test_confidence_rises_with_price(self):
+        by_price = sorted((p for p in self.bootstrap["elements"]
+                           if p["element_type"] == 2),
+                          key=lambda p: p["now_cost"])
+        self.assertLessEqual(self.scorer._ownership_confidence(by_price[0]),
+                             self.scorer._ownership_confidence(by_price[-1]))
+
+    def test_cheap_bench_keepers_are_not_projected_as_starters(self):
+        """Regression: the ownership floor once put backup keepers in the XI."""
+        for player in self.bootstrap["elements"]:
+            is_cheap_keeper = (player["element_type"] == 1
+                               and player["now_cost"] <= 40)
+            heavily_owned = float(player["selected_by_percent"] or 0) > 15
+            if is_cheap_keeper and heavily_owned:
+                self.assertLess(
+                    self.scorer._expected_minutes(player), 70.0,
+                    f"{player['web_name']} projected as a near-full-time starter")
+
+
 class TestSetPiecePremium(unittest.TestCase):
     """Set-piece duty is new-season information history cannot contain."""
 

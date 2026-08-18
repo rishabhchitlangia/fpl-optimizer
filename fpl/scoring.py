@@ -104,7 +104,14 @@ SET_PIECE_CREATOR_PREMIUM = 0.20
 #: Ownership percentage at which the crowd is treated as confident a player
 #: starts. Used only as a *floor* on the start-rate prior — see
 #: ``BayesianRateScorer._expected_minutes`` for why the asymmetry matters.
-OWNERSHIP_NAILED_PIVOT = 20.0
+OWNERSHIP_NAILED_PIVOT = 30.0
+
+#: Price above a position's cheapest player, in millions, at which ownership is
+#: fully trusted as a starting signal. Below this the signal is faded out: a
+#: heavily-owned minimum-price player is bench fodder that many managers hold
+#: precisely so it never plays, which is the opposite of what ownership means
+#: for a premium asset.
+OWNERSHIP_PRICE_CONFIDENCE_SPAN = 1.5
 
 #: Highest start rate ownership alone will imply.
 OWNERSHIP_START_CEILING = 0.92
@@ -112,6 +119,32 @@ OWNERSHIP_START_CEILING = 0.92
 #: Sensitivity of the no-history prior to club strength, per point of the
 #: game's 1-5 ``strength_overall`` scale.
 TEAM_STRENGTH_BETA = 0.08
+
+#: Per-season decay applied when looking for a player's *peak* minutes level.
+#: Deliberately gentler than :data:`SEASON_DECAY`: the recency-weighted mean
+#: answers "what does this player do lately", whereas the peak answers "what is
+#: this player capable of when fit and in favour", and capability fades more
+#: slowly than form.
+PEAK_SEASON_DECAY = 0.8
+
+#: How much of a past peak we are willing to project forward. Below 1.0 because
+#: a player who once played every minute may not reclaim that role.
+PEAK_TRUST = 0.85
+
+#: Minutes a starter is assumed to play, allowing for substitutions.
+STARTER_MINUTES = 85.0
+
+#: Minutes a non-starting appearance contributes on average.
+CAMEO_MINUTES = 12.0
+
+#: Players who joined their club on or after this date are treated as new
+#: signings whose historical minutes were earned elsewhere.
+NEW_SIGNING_CUTOFF = "2026-06-01"
+
+#: Multiplier on minutes shrinkage for new signings. Their past minutes are
+#: real but were earned in a different squad, so their new role is genuinely
+#: more uncertain and the prior should carry more weight.
+NEW_SIGNING_SHRINKAGE_FACTOR = 2.5
 
 POSITION_NAMES = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
 
@@ -261,6 +294,9 @@ class HistoricalRates:
         weighted_starts: Recency-weighted starts.
         weighted_games: Recency-weighted games available to start.
         raw_seasons: How many prior seasons contributed.
+        minutes_per_game: Minutes per league game for each prior season, most
+            recent first. Used to recover a player's peak involvement, which the
+            recency-weighted mean hides when a recent season was lost to injury.
     """
 
     weighted_90s: float
@@ -268,6 +304,26 @@ class HistoricalRates:
     weighted_starts: float
     weighted_games: float
     raw_seasons: int
+    minutes_per_game: tuple[float, ...] = ()
+
+    @property
+    def weighted_minutes(self) -> float:
+        """Recency-weighted total minutes."""
+        return self.weighted_90s * 90.0
+
+    def peak_minutes_per_game(self) -> float:
+        """Return the best minutes-per-game level this player has sustained.
+
+        Each season's level is discounted by :data:`PEAK_SEASON_DECAY` per year
+        of age and by :data:`PEAK_TRUST`, so an old peak counts for less than a
+        recent one but is not erased by a single wrecked season.
+        """
+        if not self.minutes_per_game:
+            return 0.0
+        return max(
+            level * (PEAK_SEASON_DECAY ** age) * PEAK_TRUST
+            for age, level in enumerate(self.minutes_per_game)
+        )
 
 
 def historical_rates(summary: dict | None, decay: float = SEASON_DECAY) -> HistoricalRates:
@@ -288,9 +344,14 @@ def historical_rates(summary: dict | None, decay: float = SEASON_DECAY) -> Histo
 
     seasons = summary["history_past"]
     w90 = wpts = wstarts = wgames = 0.0
+    per_season: list[float] = []
+
     for offset, season in enumerate(reversed(seasons)):
         weight = decay ** offset
         minutes = float(season.get("minutes") or 0)
+        # Recorded even when zero: a season sat out is information about the
+        # mean, and skipping it here would silently inflate the average.
+        per_season.append(minutes / 38.0)
         if minutes <= 0:
             continue
         w90 += weight * minutes / 90.0
@@ -299,7 +360,8 @@ def historical_rates(summary: dict | None, decay: float = SEASON_DECAY) -> Histo
         # A full PL season is 38 games; used as the denominator for start rate.
         wgames += weight * 38.0
 
-    return HistoricalRates(w90, wpts, wstarts, wgames, len(seasons))
+    return HistoricalRates(w90, wpts, wstarts, wgames, len(seasons),
+                           tuple(per_season))
 
 
 # --------------------------------------------------------------------------- #
@@ -532,6 +594,7 @@ class BayesianRateScorer(PlayerScorer):
         self.teams = {t["id"]: t for t in bootstrap["teams"]}
         self.prior = PricePrior(self.players, summaries)
         self._minutes_prior = self._fit_minutes_prior()
+        self._position_min_price = self._find_position_min_prices()
 
     def _fit_minutes_prior(self) -> dict[int, float]:
         """Return a per-position mean start rate, used when history is thin."""
@@ -584,12 +647,68 @@ class BayesianRateScorer(PlayerScorer):
 
         return base + set_piece_premium(player) * self._prior_reliance(rates)
 
+    def _find_position_min_prices(self) -> dict[int, int]:
+        """Return the cheapest available price in each position."""
+        minima: dict[int, int] = {}
+        for player in self.players:
+            position = player["element_type"]
+            price = player["now_cost"]
+            if position not in minima or price < minima[position]:
+                minima[position] = price
+        return minima
+
+    def _ownership_confidence(self, player: dict) -> float:
+        """How far a player's price implies they are bought in order to play.
+
+        Ownership means opposite things at opposite ends of the price range. A
+        heavily-owned £12m midfielder is owned because managers expect him to
+        start and score. A heavily-owned £4.0m goalkeeper is owned as bench
+        fodder — held *because* he is cheap, often precisely so he never plays.
+        Reading the second as evidence of nailed-on minutes puts backup keepers
+        in the starting XI.
+
+        Returns 0.0 at a position's minimum price, rising to 1.0 once a player
+        is :data:`OWNERSHIP_PRICE_CONFIDENCE_SPAN` above it.
+        """
+        floor_price = self._position_min_price.get(player["element_type"],
+                                                   player["now_cost"])
+        excess = (player["now_cost"] - floor_price) / 10.0
+        return max(0.0, min(1.0, excess / OWNERSHIP_PRICE_CONFIDENCE_SPAN))
+
+    def _is_new_signing(self, player: dict) -> bool:
+        """Whether a player joined their current club in the latest window."""
+        joined = player.get("team_join_date") or ""
+        return joined >= NEW_SIGNING_CUTOFF
+
     def _expected_minutes(self, player: dict) -> float:
         """Estimate minutes per fixture, before availability is applied.
 
-        Start rate is shrunk toward the positional mean, then converted to
-        minutes assuming starters average 85 minutes and non-starting
-        appearances contribute a short cameo.
+        Worked in minutes-per-game space rather than as a start/bench
+        dichotomy, because minutes-per-game is what the projection actually
+        needs and it is directly observable per season.
+
+        Three corrections matter, all of which need more than one season of
+        history to compute:
+
+        1. **Peak capability floor.** The recency-weighted mean is the right
+           estimate of recent involvement, but it badly understates a player
+           whose most recent season was lost to injury or a fallen-out-of-favour
+           spell — and recency weighting makes that *worse*, since the wrecked
+           season carries the highest weight. So the estimate is floored at the
+           player's decayed peak: what they have proven they can sustain when
+           fit and in the team. A player with three full seasons and one blank
+           is projected on the three, not the blank.
+
+        2. **New-signing uncertainty.** Minutes earned at a previous club are
+           real evidence but weaker evidence — the role at the new club is
+           unproven. Shrinkage toward the price-implied prior is widened for
+           these players rather than trusting the old club's numbers outright.
+
+        3. **Ownership floor**, as documented below.
+
+        None of this predicts the literal starting XI. No public data source
+        gives confirmed line-ups before the deadline; this estimates expected
+        minutes, which is what the points projection needs.
         """
         rates = historical_rates(self.summaries.get(player["id"]))
         position_prior = self._minutes_prior.get(player["element_type"], 0.5)
@@ -597,6 +716,22 @@ class BayesianRateScorer(PlayerScorer):
         # A price-relative nudge: within a position, expensive players start.
         price_prior = self.prior.rate_for(player)
         prior_start_rate = min(0.95, max(0.15, position_prior * (price_prior / 4.0)))
+        prior_minutes = (prior_start_rate * STARTER_MINUTES
+                         + (1.0 - prior_start_rate) * CAMEO_MINUTES)
+
+        shrinkage = MINUTES_SHRINKAGE_GAMES
+        if self._is_new_signing(player):
+            shrinkage *= NEW_SIGNING_SHRINKAGE_FACTOR
+
+        shrunk = ((rates.weighted_minutes + shrinkage * prior_minutes)
+                  / (rates.weighted_games + shrinkage))
+
+        # Capability floor. Also shrunk for new signings, since a peak reached
+        # at another club is likewise weaker evidence here.
+        peak = rates.peak_minutes_per_game()
+        if self._is_new_signing(player):
+            peak *= 0.8
+        minutes = max(shrunk, min(peak, STARTER_MINUTES))
 
         # Ownership is applied as a FLOOR, never a ceiling, and only to minutes
         # -- never to the points rate. The asymmetry and the restriction are
@@ -609,19 +744,16 @@ class BayesianRateScorer(PlayerScorer):
         #     template, surrendering the upside of being different. Feeding it
         #     into minutes captures the part the crowd genuinely knows -- who
         #     starts -- without copying its view of who is good.
+        # ...and faded out at the cheap end, where ownership signals bench
+        # fodder rather than a starting berth. See _ownership_confidence.
         ownership = float(player.get("selected_by_percent") or 0.0)
-        ownership_floor = min(OWNERSHIP_START_CEILING,
-                              ownership / OWNERSHIP_NAILED_PIVOT * OWNERSHIP_START_CEILING)
-        prior_start_rate = max(prior_start_rate, ownership_floor)
+        ownership_share = min(1.0, ownership / OWNERSHIP_NAILED_PIVOT)
+        ownership_floor = (ownership_share
+                           * self._ownership_confidence(player)
+                           * OWNERSHIP_START_CEILING
+                           * STARTER_MINUTES)
 
-        observed_starts = rates.weighted_starts
-        observed_games = rates.weighted_games
-        start_rate = (
-            observed_starts + MINUTES_SHRINKAGE_GAMES * prior_start_rate
-        ) / (observed_games + MINUTES_SHRINKAGE_GAMES)
-
-        # 85 minutes for a start, plus a modest cameo share for non-starts.
-        return start_rate * 85.0 + (1.0 - start_rate) * 12.0
+        return min(90.0, max(minutes, ownership_floor))
 
     def project(self, gameweeks: Sequence[int]) -> dict[int, Projection]:
         projections: dict[int, Projection] = {}

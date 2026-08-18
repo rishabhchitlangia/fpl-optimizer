@@ -154,8 +154,19 @@ points = availability
   half-season wonder is pulled toward what their price implies. Players with no
   Premier League history — promoted clubs, overseas signings — fall back
   entirely to the price prior, which is fitted per position by least squares.
-- **Projected minutes** come from historical start rate, shrunk the same way,
-  scaled by FPL's injury/availability flags.
+- **Projected minutes** are worked in minutes-per-game space across every
+  season of history, with three corrections that need more than one season to
+  compute:
+  - a **peak-capability floor**, because recency weighting *over*-weights a
+    season lost to injury. A player with three full seasons and one blank is
+    projected on the three, not the blank — the peak is discounted by age, so
+    it fades without being erased;
+  - **widened uncertainty for new signings** (detected via `team_join_date`),
+    whose minutes were earned in a different squad. This pulls them toward the
+    price-implied prior in whichever direction that lies: a proven starter who
+    moves loses some certainty, an expensive signing who was a bit-part player
+    elsewhere gains some;
+  - **availability**, from FPL's injury and suspension flags.
 - **Summing over actual fixtures** means blank gameweeks contribute zero and
   double gameweeks contribute both matches, automatically.
 
@@ -177,6 +188,13 @@ thinnest:
   rate would just reproduce the crowd's opinion of quality and drag every squad
   toward the template. Into minutes, it captures the part the crowd genuinely
   knows: who starts.
+
+  It is also **faded out at the cheap end**, because ownership means opposite
+  things at opposite ends of the price range. A heavily-owned £12m midfielder is
+  owned because managers expect him to start; a heavily-owned £4.0m keeper is
+  bench fodder, held *because* he is cheap and often specifically so he never
+  plays. Reading the second as evidence of nailed-on minutes put backup keepers
+  in the starting XI until it was fixed.
 
 Three models ship, and `auto` picks between them by season stage: pure
 historical pre-season, then blending current-season evidence in as gameweeks
@@ -217,6 +235,12 @@ Stated plainly, because they bound how far to trust the output:
 - An established player who has only *just* inherited penalties gets a smaller
   set-piece bump than they deserve: historical set-piece orders are not exposed
   by the API, so a change of duty cannot be detected.
+- **Nothing here predicts the literal starting XI.** No public data source gives
+  confirmed line-ups before the deadline, and the API exposes only per-season
+  aggregates for past years — not per-match records — so "did he start the last
+  six games of last season" is not computable. The model estimates *expected
+  minutes*, which is what a points projection needs, not a team sheet. Check the
+  press conferences yourself.
 
 ---
 
@@ -243,7 +267,7 @@ fpl/
   transfers.py    Transfer plan generation and ranking, net of hits
   chips.py        Chip heuristics and blank/double gameweek detection
 main.py           CLI
-tests/            45 tests, run against live cached data
+tests/            58 tests, run against live cached data
 RULES.md          Researched 2026/27 rules, with citations
 data/cache/       Cached API responses (gitignored)
 ```
@@ -256,7 +280,7 @@ data/cache/       Cached API responses (gitignored)
 python -m unittest discover -s tests -v
 ```
 
-45 tests covering the sell-on fee, formation enumeration, squad legality
+58 tests covering the sell-on fee, formation enumeration, squad legality
 (size, positions, budget, 3-per-club), captain selection, transfer hit
 arithmetic, and chip availability windows. They run against live cached data,
 so they double as an assertion that the API still matches RULES.md — if FPL
