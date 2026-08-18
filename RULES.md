@@ -344,16 +344,46 @@ Stated plainly so the scope is clear:
 
 ## 8. Season-state caveat (important for Stage 2)
 
-At the time of writing the season **has not started**. That means:
+At the time of writing the season **has not started** (0 of 38 gameweeks played).
+The available signal is *not* uniformly empty — it breaks down as follows, all
+verified empirically against the live API on 18 Aug 2026:
 
-- `ep_next`, `form`, `points_per_game`, `total_points` and all the per-90 stats
-  are **zero or near-zero** for every player.
-- Any predicted-points model built on `ep_next` will produce **degenerate output
-  until GW1 has been played** — expect the optimizer to return an essentially
-  arbitrary (though rule-legal) squad.
-- `scoring.py` should therefore expose a **pluggable** scorer interface, and it
-  is worth having a price/ICT-based fallback heuristic for the pre-season and
-  early-season window when `ep_next` carries no signal.
+| Field | Pre-season state | Usable? |
+|---|---|---|
+| `form`, `ep_this` | **0 for all 590 players** | ❌ no signal |
+| `ep_next` | populated for 514/590, but **saturated: capped at 4.0** | ⚠️ weak |
+| `total_points`, `minutes`, `starts`, `goals_scored`, `expected_goals`, `defensive_contribution` | **carry last season's (2025/26) totals** for 400/590 players | ✅ strong |
+| `now_cost`, `selected_by_percent` | fully populated, reset for the new season | ✅ strong |
+| `teams[].strength_attack_*`, `strength_defence_*` | **0 for all 20 clubs** | ❌ not yet populated |
+| `teams[].strength_overall_home/away` | populated, coarse integers 1–5 | ⚠️ low resolution |
+| `fixtures[].team_h_difficulty` / `team_a_difficulty` | populated for all 380 fixtures | ✅ usable |
+
+**Verified:** bootstrap-static's `total_points` etc. are last season's, not this
+season's. Haaland's bootstrap row (239 pts / 2953 mins / 27 goals / 8 assists)
+matches his `history_past` entry for **2025/26** exactly.
+
+### The `ep_next` saturation problem
+
+`ep_next` maxes out at **4.0** and both Haaland (£15.5m) and Gabriel (£8.0m) sit
+at that cap. It cannot discriminate between elite assets pre-season. **A scorer
+built on `ep_next` alone would produce a squad that is rule-legal but
+competitively worthless for the opening gameweeks.** This is the single most
+important modelling constraint on the project.
+
+### Additional data available
+
+`/api/element-summary/{player_id}/` returns `history_past` — **full per-season
+totals going back multiple seasons** (Haaland: 2022/23 through 2025/26). This
+is the richest pre-season signal available and is what the projection model is
+built on. Cost: one HTTP request per player (590 total), so it must be cached
+aggressively and fetched concurrently.
+
+### Consequence for the design
+
+`scoring.py` exposes a **pluggable scorer interface** with more than one
+implementation, and the CLI auto-selects based on how many gameweeks have been
+played rather than defaulting to `ep_next` year-round. See `scoring.py` for the
+model specification.
 
 ---
 
