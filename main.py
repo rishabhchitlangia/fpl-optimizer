@@ -95,6 +95,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exclude a player from the squad. Name or ID. Repeatable.",
     )
     parser.add_argument(
+        "--max-ownership", type=float, default=None, metavar="PCT",
+        help="Only pick players owned by fewer than this percentage of "
+             "managers. Builds a differential squad. Costs expected points — "
+             "it discards good players purely for being popular.",
+    )
+    parser.add_argument(
         "--min-availability", type=float, default=0.0,
         help="Exclude players below this availability, 0.0-1.0. Use 1.0 to "
              "avoid every doubtful player.",
@@ -155,37 +161,51 @@ def resolve_player(token: str, players: dict[int, dict]) -> int:
 def render_squad(selection: optimizer.SquadSelection, bootstrap: dict,
                  projections: dict[int, scoring.Projection],
                  title: str) -> Table:
-    """Render a squad as a rich table, starters above bench."""
+    """Render a squad as a rich table, starters above bench.
+
+    Columns are kept narrow enough to fit an 80-column terminal. Availability
+    is folded into the name as a marker rather than given its own column, and
+    ``SP`` flags set-piece duty (``P`` penalties, ``S`` corners/free-kicks).
+    """
     table = Table(title=title, title_style="bold", header_style="bold cyan",
-                  show_lines=False)
-    table.add_column("Role", style="dim", width=12)
-    table.add_column("Player", width=18)
-    table.add_column("Pos", width=4)
-    table.add_column("Club", width=5)
-    table.add_column("Price", justify="right", width=7)
-    table.add_column("xPts", justify="right", width=6)
-    table.add_column("Note", style="yellow", width=10)
+                  show_lines=False, padding=(0, 1))
+    table.add_column("Role", style="dim", width=7)
+    table.add_column("Player", width=16, no_wrap=True)
+    table.add_column("Pos", width=3)
+    table.add_column("Club", width=4)
+    table.add_column("Price", justify="right", width=6)
+    table.add_column("xPts", justify="right", width=5)
+    table.add_column("Own%", justify="right", width=5)
+    table.add_column("SP", justify="center", width=2)
 
     rows = optimizer.describe_selection(selection, bootstrap, projections)
     for index, row in enumerate(rows):
         is_bench = row["role"] == "Bench"
-        if is_bench and index and not rows[index - 1]["role"] == "Bench":
+        if is_bench and index and rows[index - 1]["role"] != "Bench":
             table.add_section()
-        style = "dim" if is_bench else None
-        role_text = row["role"]
-        if "(C)" in role_text:
-            role_text = Text("Starter (C)", style="bold green")
-        elif "(V)" in role_text:
-            role_text = Text("Starter (V)", style="green")
+
+        if "(C)" in row["role"]:
+            role_text = Text("XI (C)", style="bold green")
+        elif "(V)" in row["role"]:
+            role_text = Text("XI (V)", style="green")
+        elif is_bench:
+            role_text = Text("Bench")
+        else:
+            role_text = Text("XI")
+
+        flag = STATUS_LABELS.get(row["status"], "")
+        name = row["name"][:14] + (" !" if flag else "")
+
         table.add_row(
             role_text,
-            row["name"][:18],
+            name,
             row["position"],
             row["team"],
             f"£{row['price']:.1f}m",
             f"{row['predicted']:.2f}",
-            STATUS_LABELS.get(row["status"], row["status"]),
-            style=style,
+            f"{row['ownership']:.1f}",
+            row["set_piece"],
+            style="dim" if is_bench else None,
         )
     return table
 
@@ -310,6 +330,17 @@ def main(argv: list[str] | None = None) -> int:
 
     locked = [resolve_player(t, players) for t in args.lock]
     banned = [resolve_player(t, players) for t in args.ban]
+
+    if args.max_ownership is not None:
+        popular = [pid for pid, p in players.items()
+                   if float(p.get("selected_by_percent") or 0) >= args.max_ownership
+                   and pid not in locked]
+        banned.extend(popular)
+        console.print(
+            f"[yellow]Differential mode:[/yellow] excluding {len(popular)} players "
+            f"owned by {args.max_ownership}%+ of managers. "
+            f"[dim]This deliberately gives up expected points.[/dim]\n"
+        )
     budget = int(round(args.budget * 10)) if args.budget else None
 
     # --- Optimal squad ------------------------------------------------- #

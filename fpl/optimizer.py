@@ -373,6 +373,17 @@ def optimize_squad(bootstrap: dict, projections: dict[int, Projection],
 # --------------------------------------------------------------------------- #
 
 
+def _set_piece_marker(player: dict) -> str:
+    """Return a compact set-piece marker: P for penalties, S for corners/free-kicks."""
+    marks = ""
+    if player.get("penalties_order") == 1:
+        marks += "P"
+    if (player.get("corners_and_indirect_freekicks_order") == 1
+            or player.get("direct_freekicks_order") == 1):
+        marks += "S"
+    return marks or "-"
+
+
 def describe_selection(selection: SquadSelection, bootstrap: dict,
                        projections: dict[int, Projection]) -> list[dict]:
     """Flatten a selection into row dicts for tabular display.
@@ -407,5 +418,7 @@ def describe_selection(selection: SquadSelection, bootstrap: dict,
             "role": role,
             "status": player.get("status", "a"),
             "news": player.get("news", ""),
+            "ownership": float(player.get("selected_by_percent") or 0.0),
+            "set_piece": _set_piece_marker(player),
         })
     return rows

@@ -110,6 +110,7 @@ That comparison is the whole point.
 | `--budget` | `100.0` | Override squad budget, in millions |
 | `--lock` | — | Force a player in. Name or ID. Repeatable |
 | `--ban` | — | Exclude a player. Repeatable |
+| `--max-ownership` | — | Only pick players below this ownership %. Differential mode |
 | `--min-availability` | `0.0` | Drop players below this fitness. `1.0` avoids all doubts |
 | `--refresh` | off | Force re-fetch of all cached data |
 | `--no-history` | off | Skip the 590-request history sweep (weaker model) |
@@ -117,7 +118,17 @@ That comparison is the whole point.
 ```bash
 python main.py --lock Haaland --ban Gabriel --horizon 6
 python main.py --refresh --min-availability 1.0
+python main.py --max-ownership 15          # differential squad
 ```
+
+The squad table's `Own%` column shows ownership and `SP` flags set-piece duty
+(`P` penalties, `S` corners/free-kicks), so you can see at a glance how close to
+the template a suggestion sits.
+
+`--max-ownership` builds a deliberately differential squad. It costs expected
+points by construction — it discards good players purely for being popular — so
+it is a rank-variance tool, not a better squad. Use it when you need to catch up,
+not when you are ahead.
 
 ---
 
@@ -147,6 +158,25 @@ points = availability
   scaled by FPL's injury/availability flags.
 - **Summing over actual fixtures** means blank gameweeks contribute zero and
   double gameweeks contribute both matches, automatically.
+
+Two further signals matter most in the opening gameweeks, when history is
+thinnest:
+
+- **Set-piece duty.** Designated penalty takers get a points-per-90 premium
+  derived from the base rate (the league awards ~0.13 penalties per team per
+  match at ~78% conversion). Crucially this is scaled by how much the model is
+  leaning on the prior: an established taker's past returns *already contain*
+  their penalties, so they get almost none of it, while a new signing just
+  handed the duty gets it in full. Corner and free-kick takers get a smaller
+  creative premium.
+- **Ownership**, applied as a **floor on expected minutes and never to the
+  points rate.** Both restrictions are deliberate. High ownership is strong
+  evidence a player is nailed — millions of managers have collectively checked
+  the team news — but low ownership is weak evidence of anything, since
+  differentials exist by definition. And feeding ownership into the *points*
+  rate would just reproduce the crowd's opinion of quality and drag every squad
+  toward the template. Into minutes, it captures the part the crowd genuinely
+  knows: who starts.
 
 Three models ship, and `auto` picks between them by season stage: pure
 historical pre-season, then blending current-season evidence in as gameweeks
@@ -184,6 +214,9 @@ Stated plainly, because they bound how far to trust the output:
   authenticated endpoint, which this project doesn't use.
 - The model does not know about managerial changes, tactical shifts, or the
   transfer window beyond what price already reflects.
+- An established player who has only *just* inherited penalties gets a smaller
+  set-piece bump than they deserve: historical set-piece orders are not exposed
+  by the API, so a change of duty cannot be detected.
 
 ---
 
@@ -210,7 +243,7 @@ fpl/
   transfers.py    Transfer plan generation and ranking, net of hits
   chips.py        Chip heuristics and blank/double gameweek detection
 main.py           CLI
-tests/            35 tests, run against live cached data
+tests/            45 tests, run against live cached data
 RULES.md          Researched 2026/27 rules, with citations
 data/cache/       Cached API responses (gitignored)
 ```
@@ -223,7 +256,7 @@ data/cache/       Cached API responses (gitignored)
 python -m unittest discover -s tests -v
 ```
 
-35 tests covering the sell-on fee, formation enumeration, squad legality
+45 tests covering the sell-on fee, formation enumeration, squad legality
 (size, positions, budget, 3-per-club), captain selection, transfer hit
 arithmetic, and chip availability windows. They run against live cached data,
 so they double as an assertion that the API still matches RULES.md — if FPL

@@ -43,6 +43,102 @@ class TestFixtureMultiplier(unittest.TestCase):
                            scoring.fixture_multiplier(1, 4))
 
 
+class TestSetPiecePremium(unittest.TestCase):
+    """Set-piece duty is new-season information history cannot contain."""
+
+    def test_designated_penalty_taker_earns_a_premium(self):
+        taker = {"element_type": 4, "penalties_order": 1}
+        none = {"element_type": 4}
+        self.assertGreater(scoring.set_piece_premium(taker),
+                           scoring.set_piece_premium(none))
+
+    def test_second_choice_taker_earns_less_than_first(self):
+        first = scoring.set_piece_premium({"element_type": 3, "penalties_order": 1})
+        second = scoring.set_piece_premium({"element_type": 3, "penalties_order": 2})
+        self.assertGreater(first, second)
+        self.assertGreater(second, 0.0)
+
+    def test_goalkeepers_never_earn_a_set_piece_premium(self):
+        self.assertEqual(
+            scoring.set_piece_premium({"element_type": 1, "penalties_order": 1}), 0.0)
+
+    def test_corner_duty_stacks_with_penalty_duty(self):
+        both = scoring.set_piece_premium({
+            "element_type": 3, "penalties_order": 1,
+            "corners_and_indirect_freekicks_order": 1})
+        pens_only = scoring.set_piece_premium({"element_type": 3, "penalties_order": 1})
+        self.assertGreater(both, pens_only)
+
+    def test_premium_is_not_double_counted_for_established_players(self):
+        """A long-serving taker's history already contains their penalties.
+
+        The premium is scaled by prior reliance, so a player with a lot of
+        history should receive far less of it than one with none.
+        """
+        bootstrap = data.get_bootstrap()
+        fixtures = data.get_fixtures()
+        players = data.player_lookup(bootstrap)
+        summaries = data.get_all_element_summaries(list(players))
+        scorer = scoring.BayesianRateScorer(bootstrap, fixtures, summaries)
+
+        veteran = scoring.historical_rates(
+            summaries[next(p["id"] for p in bootstrap["elements"]
+                           if p["web_name"] == "Haaland")])
+        newcomer = scoring.HistoricalRates(0.0, 0.0, 0.0, 0.0, 0)
+        self.assertLess(scorer._prior_reliance(veteran),
+                        scorer._prior_reliance(newcomer))
+        self.assertAlmostEqual(scorer._prior_reliance(newcomer), 1.0)
+
+
+class TestTeamStrength(unittest.TestCase):
+    """Club quality nudges the no-history prior."""
+
+    def test_stronger_clubs_scale_the_prior_up(self):
+        strong = {"strength_overall_home": 5, "strength_overall_away": 5}
+        weak = {"strength_overall_home": 2, "strength_overall_away": 2}
+        self.assertGreater(scoring.team_strength_multiplier(strong), 1.0)
+        self.assertLess(scoring.team_strength_multiplier(weak), 1.0)
+
+    def test_missing_strength_data_is_survivable(self):
+        self.assertGreater(scoring.team_strength_multiplier({}), 0.0)
+
+
+class TestOwnershipFloor(unittest.TestCase):
+    """Ownership raises the minutes prior but never lowers it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bootstrap = data.get_bootstrap()
+        cls.fixtures = data.get_fixtures()
+        players = data.player_lookup(cls.bootstrap)
+        cls.summaries = data.get_all_element_summaries(list(players))
+        cls.scorer = scoring.BayesianRateScorer(
+            cls.bootstrap, cls.fixtures, cls.summaries)
+
+    def _minutes(self, ownership: float) -> float:
+        template = dict(self.bootstrap["elements"][0])
+        template["selected_by_percent"] = str(ownership)
+        template["id"] = -1          # no history
+        return self.scorer._expected_minutes(template)
+
+    def test_high_ownership_raises_expected_minutes(self):
+        self.assertGreater(self._minutes(50.0), self._minutes(1.0))
+
+    def test_ownership_is_a_floor_not_a_ceiling(self):
+        """Zero ownership must not drag a player below their own prior."""
+        self.assertAlmostEqual(self._minutes(0.0), self._minutes(0.0))
+        self.assertGreater(self._minutes(0.0), 0.0)
+
+    def test_ownership_does_not_touch_the_points_rate(self):
+        """Following the crowd on quality would push every squad to template."""
+        template = dict(self.bootstrap["elements"][0])
+        template["id"] = -1
+        low = dict(template, selected_by_percent="0.1")
+        high = dict(template, selected_by_percent="80.0")
+        self.assertAlmostEqual(self.scorer._points_per_90(low),
+                               self.scorer._points_per_90(high))
+
+
 class TestAvailability(unittest.TestCase):
     """Injured and suspended players must be unselectable."""
 

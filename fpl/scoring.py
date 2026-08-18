@@ -86,6 +86,33 @@ PRIOR_FIT_MIN_MINUTES = 900
 #: ``status`` codes that mean a player cannot play at all.
 UNAVAILABLE_STATUSES = {"i", "s", "u", "n"}
 
+# --- Set-piece premiums, in points per 90 --------------------------------- #
+# Derivation: the Premier League awards roughly 100 penalties across 380
+# matches, i.e. ~0.13 per team per match, converted at ~78%. A nailed taker
+# therefore scores ~0.10 penalty goals per match. Multiplying by the value of a
+# goal for that position (plus a little for the bonus points a goal tends to
+# drag along, less a little for the -2 on a miss) gives the figures below.
+PENALTY_TAKER_PREMIUM = {1: 0.0, 2: 0.70, 3: 0.60, 4: 0.50}
+
+#: Second-choice takers only convert when the first choice is off the pitch.
+SECONDARY_PENALTY_FRACTION = 0.25
+
+#: Premium for the designated corner/free-kick taker, from the extra assists
+#: set-piece delivery produces (~0.07 assists per match x 3 points).
+SET_PIECE_CREATOR_PREMIUM = 0.20
+
+#: Ownership percentage at which the crowd is treated as confident a player
+#: starts. Used only as a *floor* on the start-rate prior — see
+#: ``BayesianRateScorer._expected_minutes`` for why the asymmetry matters.
+OWNERSHIP_NAILED_PIVOT = 20.0
+
+#: Highest start rate ownership alone will imply.
+OWNERSHIP_START_CEILING = 0.92
+
+#: Sensitivity of the no-history prior to club strength, per point of the
+#: game's 1-5 ``strength_overall`` scale.
+TEAM_STRENGTH_BETA = 0.08
+
 POSITION_NAMES = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
 
 
@@ -333,6 +360,61 @@ class PricePrior:
         return max(0.5, self._fallback.get(position, 3.0))
 
 
+def set_piece_premium(player: dict) -> float:
+    """Return the points-per-90 premium a player earns from set-piece duty.
+
+    Penalty duty is the dominant term; corner and free-kick duty adds a smaller
+    creative premium. Both are read from the ``*_order`` fields, which FPL
+    refreshes for the new season and which therefore carry information no
+    historical record can — a player who has just been handed penalties has
+    never shown it in their past returns.
+
+    Args:
+        player: A bootstrap ``elements`` entry.
+
+    Returns:
+        Additional points per 90 minutes. Zero for players with no set-piece
+        role, and always zero for goalkeepers.
+    """
+    element_type = player["element_type"]
+    if element_type == 1:
+        return 0.0
+
+    premium = 0.0
+    penalty_order = player.get("penalties_order")
+    if penalty_order == 1:
+        premium += PENALTY_TAKER_PREMIUM.get(element_type, 0.0)
+    elif penalty_order == 2:
+        premium += (PENALTY_TAKER_PREMIUM.get(element_type, 0.0)
+                    * SECONDARY_PENALTY_FRACTION)
+
+    takes_corners = player.get("corners_and_indirect_freekicks_order") == 1
+    takes_freekicks = player.get("direct_freekicks_order") == 1
+    if takes_corners or takes_freekicks:
+        premium += SET_PIECE_CREATOR_PREMIUM
+
+    return premium
+
+
+def team_strength_multiplier(team: dict) -> float:
+    """Scale a no-history prior by club quality.
+
+    Price already encodes much of this, but not all of it — a £5.5m midfielder
+    at a title contender is not the same asset as a £5.5m midfielder at a
+    promoted club. Uses ``strength_overall_home``/``away``, which are populated
+    pre-season even though the finer attack/defence splits are not.
+
+    Args:
+        team: A bootstrap ``teams`` entry.
+
+    Returns:
+        A multiplier centred on 1.0 for a mid-table club.
+    """
+    home = team.get("strength_overall_home") or 3
+    away = team.get("strength_overall_away") or 3
+    return 1.0 + TEAM_STRENGTH_BETA * ((home + away) / 2.0 - 3.5)
+
+
 # --------------------------------------------------------------------------- #
 # Scorer interface
 # --------------------------------------------------------------------------- #
@@ -447,6 +529,7 @@ class BayesianRateScorer(PlayerScorer):
         self.players = bootstrap["elements"]
         self.context = FixtureContext(fixtures)
         self.summaries = summaries
+        self.teams = {t["id"]: t for t in bootstrap["teams"]}
         self.prior = PricePrior(self.players, summaries)
         self._minutes_prior = self._fit_minutes_prior()
 
@@ -464,13 +547,42 @@ class BayesianRateScorer(PlayerScorer):
             for pos, vals in by_position.items()
         }
 
+    def _prior_reliance(self, rates: HistoricalRates) -> float:
+        """Return how much weight the prior carries for a player, 0.0-1.0.
+
+        This is the shrinkage weight ``K / (N + K)``: 1.0 for a player with no
+        history at all, approaching 0.0 for a long-serving regular.
+        """
+        return RATE_SHRINKAGE_90S / (rates.weighted_90s + RATE_SHRINKAGE_90S)
+
     def _points_per_90(self, player: dict) -> float:
-        """Shrink a player's historical rate toward their price-implied prior."""
+        """Shrink a player's historical rate toward their price-implied prior.
+
+        The price prior is nudged by club strength, since price alone does not
+        fully separate a mid-priced player at a strong club from one at a weak
+        club.
+
+        The set-piece premium is scaled by :meth:`_prior_reliance` rather than
+        applied flat. This matters: an established penalty taker's past returns
+        *already contain* their penalty goals, so adding a premium on top would
+        double-count them. A player with no history has nothing to double-count,
+        so they receive it in full — which is exactly the case the premium
+        exists to cover, a new signing just handed the duty.
+
+        Known limitation: an established player who has only *just* inherited
+        penalties gets a smaller bump than they deserve, because historical
+        set-piece orders are not exposed by the API and the change cannot be
+        detected.
+        """
         rates = historical_rates(self.summaries.get(player["id"]))
-        prior_rate = self.prior.rate_for(player)
+        team = self.teams.get(player["team"], {})
+        prior_rate = self.prior.rate_for(player) * team_strength_multiplier(team)
+
         numerator = rates.weighted_points + RATE_SHRINKAGE_90S * prior_rate
         denominator = rates.weighted_90s + RATE_SHRINKAGE_90S
-        return numerator / denominator
+        base = numerator / denominator
+
+        return base + set_piece_premium(player) * self._prior_reliance(rates)
 
     def _expected_minutes(self, player: dict) -> float:
         """Estimate minutes per fixture, before availability is applied.
@@ -485,6 +597,22 @@ class BayesianRateScorer(PlayerScorer):
         # A price-relative nudge: within a position, expensive players start.
         price_prior = self.prior.rate_for(player)
         prior_start_rate = min(0.95, max(0.15, position_prior * (price_prior / 4.0)))
+
+        # Ownership is applied as a FLOOR, never a ceiling, and only to minutes
+        # -- never to the points rate. The asymmetry and the restriction are
+        # both deliberate:
+        #   * High ownership is strong evidence a player is nailed; millions of
+        #     managers have collectively checked the team news. Low ownership is
+        #     weak evidence of anything, since differentials exist by definition.
+        #   * Feeding ownership into the points rate would simply reproduce the
+        #     crowd's opinion of quality and push every squad toward the
+        #     template, surrendering the upside of being different. Feeding it
+        #     into minutes captures the part the crowd genuinely knows -- who
+        #     starts -- without copying its view of who is good.
+        ownership = float(player.get("selected_by_percent") or 0.0)
+        ownership_floor = min(OWNERSHIP_START_CEILING,
+                              ownership / OWNERSHIP_NAILED_PIVOT * OWNERSHIP_START_CEILING)
+        prior_start_rate = max(prior_start_rate, ownership_floor)
 
         observed_starts = rates.weighted_starts
         observed_games = rates.weighted_games
