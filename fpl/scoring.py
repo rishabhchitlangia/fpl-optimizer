@@ -51,6 +51,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Sequence
 
+from fpl import dixon_coles
+
 log = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
@@ -70,8 +72,18 @@ RATE_SHRINKAGE_90S = 8.0
 MINUTES_SHRINKAGE_GAMES = 6.0
 
 #: Fixture sensitivity by position. Clean sheets are binary and swingy, so
-#: defensive assets swing harder on fixture quality than attackers do.
+#: defensive assets swing harder on fixture quality than attackers do. Used by
+#: the fixture-difficulty baseline; the Dixon-Coles path uses
+#: :data:`POSITION_DEFENSIVE_SHARE` instead.
 FIXTURE_BETA = {1: 0.25, 2: 0.25, 3: 0.18, 4: 0.18}
+
+#: How much of each position's fixture sensitivity is defensive rather than
+#: attacking, used to combine clean-sheet and expected-goals multipliers.
+#:
+#: Goalkeepers are below 1.0 on purpose: a hard fixture costs them clean-sheet
+#: points but hands them save points, and the two partly cancel. Forwards are at
+#: 0.0 — they earn nothing from a clean sheet (RULES.md §2.1).
+POSITION_DEFENSIVE_SHARE = {1: 0.70, 2: 0.60, 3: 0.15, 4: 0.0}
 
 #: Neutral fixture difficulty. FDR runs 1 (easiest) to 5 (hardest).
 NEUTRAL_FDR = 3.0
@@ -168,6 +180,12 @@ class Projection:
         expected_minutes: Projected minutes per fixture.
         availability: Probability the player features at all, 0.0-1.0.
         model: Name of the model that produced this.
+        clean_sheet_probability: Probability the player's club concedes zero
+            across the horizon's fixtures, from the Dixon-Coles fit. ``None``
+            when no results model is available. For a double gameweek this is
+            the probability of a clean sheet in *at least one* fixture.
+        expected_goal_involvement: Expected goals plus assists for this player
+            over the horizon. ``None`` when no results model is available.
     """
 
     player_id: int
@@ -178,6 +196,8 @@ class Projection:
     expected_minutes: float = 0.0
     availability: float = 1.0
     model: str = ""
+    clean_sheet_probability: float | None = None
+    expected_goal_involvement: float | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -237,6 +257,79 @@ class FixtureContext:
 
     def _all_teams(self) -> set[int]:
         return {team for team, _ in self._by_team_gw}
+
+
+class FixtureModel:
+    """Turns a fixture into a multiplier on a player's baseline scoring rate.
+
+    Two sources, blended:
+
+    * the **fixture-difficulty baseline**, FPL's own 1-5 FDR, always available;
+    * a fitted **Dixon-Coles** model (:mod:`fpl.dixon_coles`), available only
+      once enough of this season's results are in.
+
+    The blend is governed by :func:`fpl.dixon_coles.blend_weight`, so the
+    handover is gradual: FDR alone pre-season, roughly even at six gameweeks,
+    mostly Dixon-Coles thereafter.
+
+    Both sources return a multiplier **normalised to 1.0 for an average
+    fixture**, which is what keeps this compatible with the rest of the model.
+    The projection scales a player's *empirically observed* points-per-90, and
+    that rate already contains the clean sheets and goals they historically
+    earned. Adding absolute clean-sheet points on top would count them twice.
+    So the Dixon-Coles output is used to say *how much better or worse than
+    usual* this particular fixture is — never to reconstruct points from
+    scratch.
+    """
+
+    def __init__(self, context: "FixtureContext",
+                 fit: "dixon_coles.DixonColesFit | None" = None) -> None:
+        self.context = context
+        self.fit = fit
+        self.weight = dixon_coles.blend_weight(fit.matches_per_team) if fit else 0.0
+        self._average_clean_sheet = fit.league_average_clean_sheet() if fit else None
+        self._average_goals = fit.league_average_goals() if fit else None
+
+    @property
+    def has_results_model(self) -> bool:
+        """Whether a fitted results model is contributing at all."""
+        return self.fit is not None and self.weight > 0.0
+
+    def clean_sheet_probability(self, team_id: int,
+                                fixture: "TeamFixture") -> float | None:
+        """Return P(clean sheet) for a club in a fixture, or ``None`` unfitted."""
+        if self.fit is None:
+            return None
+        return self.fit.project(team_id, fixture.opponent_id,
+                                fixture.is_home).clean_sheet_probability
+
+    def expected_goals(self, team_id: int,
+                       fixture: "TeamFixture") -> float | None:
+        """Return a club's expected goals in a fixture, or ``None`` unfitted."""
+        if self.fit is None:
+            return None
+        return self.fit.project(team_id, fixture.opponent_id,
+                                fixture.is_home).expected_goals_for
+
+    def multiplier(self, element_type: int, team_id: int,
+                   fixture: "TeamFixture") -> float:
+        """Return the scoring multiplier for a player in a fixture."""
+        baseline = fixture_multiplier(fixture.difficulty, element_type)
+        if not self.has_results_model:
+            return baseline
+
+        clean_sheet = self.clean_sheet_probability(team_id, fixture)
+        goals = self.expected_goals(team_id, fixture)
+        if clean_sheet is None or goals is None:
+            return baseline
+
+        defensive = clean_sheet / self._average_clean_sheet if self._average_clean_sheet else 1.0
+        attacking = goals / self._average_goals if self._average_goals else 1.0
+
+        share = POSITION_DEFENSIVE_SHARE.get(element_type, 0.0)
+        modelled = share * defensive + (1.0 - share) * attacking
+
+        return self.weight * modelled + (1.0 - self.weight) * baseline
 
 
 def fixture_multiplier(difficulty: int, element_type: int) -> float:
@@ -362,6 +455,35 @@ def historical_rates(summary: dict | None, decay: float = SEASON_DECAY) -> Histo
 
     return HistoricalRates(w90, wpts, wstarts, wgames, len(seasons),
                            tuple(per_season))
+
+
+def historical_goal_involvement_per_90(summary: dict | None,
+                                       decay: float = SEASON_DECAY) -> float:
+    """Return recency-weighted expected goal involvements per 90 minutes.
+
+    Prefers FPL's own ``expected_goal_involvements`` (xG + xA) where recorded,
+    since it is far less noisy than raw goals plus assists, and falls back to
+    actual goals and assists for seasons predating the expected-stats feed.
+    """
+    if not summary or not summary.get("history_past"):
+        return 0.0
+
+    weighted_involvement = weighted_90s = 0.0
+    for offset, season in enumerate(reversed(summary["history_past"])):
+        minutes = float(season.get("minutes") or 0)
+        if minutes <= 0:
+            continue
+        weight = decay ** offset
+        expected = season.get("expected_goal_involvements")
+        if expected in (None, "", 0, "0.00"):
+            involvement = (float(season.get("goals_scored") or 0)
+                           + float(season.get("assists") or 0))
+        else:
+            involvement = float(expected)
+        weighted_involvement += weight * involvement
+        weighted_90s += weight * minutes / 90.0
+
+    return weighted_involvement / weighted_90s if weighted_90s > 0 else 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -587,9 +709,11 @@ class BayesianRateScorer(PlayerScorer):
     name = "bayes-rate"
 
     def __init__(self, bootstrap: dict, fixtures: Sequence[dict],
-                 summaries: dict[int, dict]) -> None:
+                 summaries: dict[int, dict],
+                 fixture_model: FixtureModel | None = None) -> None:
         self.players = bootstrap["elements"]
         self.context = FixtureContext(fixtures)
+        self.fixture_model = fixture_model or FixtureModel(self.context)
         self.summaries = summaries
         self.teams = {t["id"]: t for t in bootstrap["teams"]}
         self.prior = PricePrior(self.players, summaries)
@@ -757,22 +881,49 @@ class BayesianRateScorer(PlayerScorer):
 
     def project(self, gameweeks: Sequence[int]) -> dict[int, Projection]:
         projections: dict[int, Projection] = {}
+        model_name = self.name
+        if self.fixture_model.has_results_model:
+            model_name = f"{self.name}+dixon-coles(w={self.fixture_model.weight:.2f})"
+
         for player in self.players:
             avail = availability(player)
             rate = self._points_per_90(player)
             minutes = self._expected_minutes(player)
             per_fixture = avail * (minutes / 90.0) * rate
+            involvement_rate = historical_goal_involvement_per_90(
+                self.summaries.get(player["id"]))
 
             per_gw: dict[int, float] = {}
             counts: dict[int, int] = {}
             total = 0.0
+            involvement = 0.0
+            # Probability of conceding in every fixture, so the complement is
+            # "kept at least one clean sheet" -- the right framing for a double.
+            concede_all = 1.0
+            saw_clean_sheet_data = False
+
             for gw in gameweeks:
                 team_fixtures = self.context.fixtures_for(player["team"], gw)
                 counts[gw] = len(team_fixtures)
-                points = sum(
-                    per_fixture * fixture_multiplier(fx.difficulty, player["element_type"])
-                    for fx in team_fixtures
-                )
+                points = 0.0
+
+                for fixture in team_fixtures:
+                    multiplier = self.fixture_model.multiplier(
+                        player["element_type"], player["team"], fixture)
+                    points += per_fixture * multiplier
+
+                    goals = self.fixture_model.expected_goals(player["team"], fixture)
+                    if goals is not None:
+                        league_goals = self.fixture_model._average_goals or 1.0
+                        involvement += (involvement_rate * (minutes / 90.0) * avail
+                                        * goals / league_goals)
+
+                    clean_sheet = self.fixture_model.clean_sheet_probability(
+                        player["team"], fixture)
+                    if clean_sheet is not None:
+                        saw_clean_sheet_data = True
+                        concede_all *= (1.0 - clean_sheet)
+
                 per_gw[gw] = points
                 total += points
 
@@ -784,7 +935,9 @@ class BayesianRateScorer(PlayerScorer):
                 points_per_90=rate,
                 expected_minutes=minutes,
                 availability=avail,
-                model=self.name,
+                model=model_name,
+                clean_sheet_probability=(1.0 - concede_all) if saw_clean_sheet_data else None,
+                expected_goal_involvement=involvement if self.fixture_model.has_results_model else None,
             )
         return projections
 
@@ -871,13 +1024,19 @@ def build_scorer(bootstrap: dict, fixtures: Sequence[dict],
     state = get_game_state(bootstrap)
     summaries = summaries or {}
 
+    # Fit the results model once and share it. Returns None until enough of
+    # this season has been played, in which case FixtureModel falls back to FDR.
+    context = FixtureContext(fixtures)
+    fit = dixon_coles.fit(fixtures, [t["id"] for t in bootstrap["teams"]])
+    fixture_model = FixtureModel(context, fit)
+
     if model == "ep_next":
         return EPNextScorer(bootstrap, fixtures)
     if model == "bayes":
-        return BayesianRateScorer(bootstrap, fixtures, summaries)
+        return BayesianRateScorer(bootstrap, fixtures, summaries, fixture_model)
     if model == "blended":
         return BlendedScorer(
-            BayesianRateScorer(bootstrap, fixtures, summaries),
+            BayesianRateScorer(bootstrap, fixtures, summaries, fixture_model),
             EPNextScorer(bootstrap, fixtures),
             state.finished_gws,
         )
@@ -890,9 +1049,9 @@ def build_scorer(bootstrap: dict, fixtures: Sequence[dict],
         log.warning("No player history available; falling back to ep_next.")
         return EPNextScorer(bootstrap, fixtures)
     if not state.season_started:
-        return BayesianRateScorer(bootstrap, fixtures, summaries)
+        return BayesianRateScorer(bootstrap, fixtures, summaries, fixture_model)
     return BlendedScorer(
-        BayesianRateScorer(bootstrap, fixtures, summaries),
+        BayesianRateScorer(bootstrap, fixtures, summaries, fixture_model),
         EPNextScorer(bootstrap, fixtures),
         state.finished_gws,
     )

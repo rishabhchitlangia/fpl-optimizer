@@ -200,6 +200,58 @@ Three models ship, and `auto` picks between them by season stage: pure
 historical pre-season, then blending current-season evidence in as gameweeks
 accumulate (equal weight at roughly GW6).
 
+### The results model (Dixon-Coles)
+
+Once enough of the season has been played, a simplified **Dixon-Coles** model is
+fitted to actual scorelines and takes over from FPL's fixture-difficulty ratings.
+
+Goals are Poisson with per-club attack and defence strengths plus a league-wide
+home advantage:
+
+```
+lambda_home = exp(attack[home] + defence[away] + home_advantage)
+lambda_away = exp(attack[away] + defence[home])
+```
+
+Dixon and Coles' addition over plain Poisson is the `tau` correction, which
+reweights the four lowest scorelines (0-0, 1-0, 0-1, 1-1). That is not
+incidental here — those are exactly the scorelines that decide clean sheets, so
+it sharpens the quantity the model exists to produce. Matches are time-decayed
+so recent form leads.
+
+From the fit come the two outputs that matter:
+
+- **Clean sheet probability**, read off the corrected score matrix (not
+  `exp(-lambda)`, so it inherits the tau correction). Over a double gameweek it
+  is the probability of a clean sheet in *at least one* fixture.
+- **Expected goal involvement**, from the player's historical xG+xA per 90
+  scaled by their club's expected goals in that specific fixture.
+
+**It will not fit early, by design.** The model has 41 free parameters and a
+gameweek supplies 20 goal observations, so an unpenalised fit after two
+gameweeks produces nonsense — a club that wins 4-0 gets an attack strength
+implying four goals every week. Three guards apply:
+
+1. No fit at all below 20 finished matches; the CLI says so and falls back to
+   fixture difficulty.
+2. A fixed L2 penalty toward league average. Fixed rather than
+   dataset-scaled, so it is self-correcting: it dominates a three-gameweek
+   sample and fades over a season.
+3. Even once fitted, output is blended against the fixture-difficulty baseline,
+   reaching even weight at roughly six gameweeks.
+
+**The double-counting guard.** The projection scales a player's *observed*
+points-per-90, which already contains the clean sheets and goals they
+historically earned. So the results model is used only to say how much better or
+worse than average a given fixture is — its multipliers are normalised to 1.0
+across the league — never to reconstruct points from scratch. There is a test
+asserting exactly this.
+
+Because the model cannot be fitted pre-season, it is validated against
+**simulated seasons with known parameters**. Those tests caught two real bugs
+that live data could not have: regularisation crushing every club toward
+average, and `rho` pinning itself to its bound on noise.
+
 ### Swapping in your own model
 
 Subclass `PlayerScorer` and implement one method:
@@ -263,11 +315,12 @@ so they stay correct if FPL changes them.
 fpl/
   data.py         API client: fetching, caching, retries, concurrency
   scoring.py      Predicted-points models (pluggable)
+  dixon_coles.py  Poisson goals model: clean sheets and expected goals
   optimizer.py    MILP squad selection and starting-XI picker
   transfers.py    Transfer plan generation and ranking, net of hits
   chips.py        Chip heuristics and blank/double gameweek detection
 main.py           CLI
-tests/            58 tests, run against live cached data
+tests/            84 tests, live cached data + simulated seasons
 RULES.md          Researched 2026/27 rules, with citations
 data/cache/       Cached API responses (gitignored)
 ```
@@ -280,7 +333,7 @@ data/cache/       Cached API responses (gitignored)
 python -m unittest discover -s tests -v
 ```
 
-58 tests covering the sell-on fee, formation enumeration, squad legality
+84 tests covering the sell-on fee, formation enumeration, squad legality
 (size, positions, budget, 3-per-club), captain selection, transfer hit
 arithmetic, and chip availability windows. They run against live cached data,
 so they double as an assertion that the API still matches RULES.md — if FPL

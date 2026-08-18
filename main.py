@@ -28,6 +28,7 @@ from rich.table import Table
 from rich.text import Text
 
 from fpl import chips as chips_module
+from fpl import dixon_coles
 from fpl import data, optimizer, scoring, transfers
 
 console = Console()
@@ -163,50 +164,70 @@ def render_squad(selection: optimizer.SquadSelection, bootstrap: dict,
                  title: str) -> Table:
     """Render a squad as a rich table, starters above bench.
 
-    Columns are kept narrow enough to fit an 80-column terminal. Availability
-    is folded into the name as a marker rather than given its own column, and
-    ``SP`` flags set-piece duty (``P`` penalties, ``S`` corners/free-kicks).
+    The columns adapt to what the model can actually produce. Pre-season the
+    useful signals are ownership and set-piece duty; once the Dixon-Coles
+    results model is live, clean-sheet probability and expected goal
+    involvement replace the set-piece marker, since role information has by
+    then been superseded by observed results.
     """
+    rows = optimizer.describe_selection(selection, bootstrap, projections)
+    has_results_model = any(
+        projections.get(row["id"]) is not None
+        and projections[row["id"]].clean_sheet_probability is not None
+        for row in rows
+    )
+
     table = Table(title=title, title_style="bold", header_style="bold cyan",
                   show_lines=False, padding=(0, 1))
-    table.add_column("Role", style="dim", width=7)
-    table.add_column("Player", width=16, no_wrap=True)
+    table.add_column("Role", style="dim", width=6)
+    table.add_column("Player", width=14, no_wrap=True)
     table.add_column("Pos", width=3)
     table.add_column("Club", width=4)
     table.add_column("Price", justify="right", width=6)
     table.add_column("xPts", justify="right", width=5)
-    table.add_column("Own%", justify="right", width=5)
-    table.add_column("SP", justify="center", width=2)
+    table.add_column("Own%", justify="right", width=4)
+    if has_results_model:
+        table.add_column("CS%", justify="right", width=4)
+        table.add_column("xGI", justify="right", width=4)
+    else:
+        table.add_column("SP", justify="center", width=2)
 
-    rows = optimizer.describe_selection(selection, bootstrap, projections)
     for index, row in enumerate(rows):
         is_bench = row["role"] == "Bench"
         if is_bench and index and rows[index - 1]["role"] != "Bench":
             table.add_section()
 
         if "(C)" in row["role"]:
-            role_text = Text("XI (C)", style="bold green")
+            role_text = Text("XI(C)", style="bold green")
         elif "(V)" in row["role"]:
-            role_text = Text("XI (V)", style="green")
+            role_text = Text("XI(V)", style="green")
         elif is_bench:
             role_text = Text("Bench")
         else:
             role_text = Text("XI")
 
         flag = STATUS_LABELS.get(row["status"], "")
-        name = row["name"][:14] + (" !" if flag else "")
+        name = row["name"][:12] + (" !" if flag else "")
 
-        table.add_row(
+        cells = [
             role_text,
             name,
             row["position"],
             row["team"],
             f"£{row['price']:.1f}m",
             f"{row['predicted']:.2f}",
-            f"{row['ownership']:.1f}",
-            row["set_piece"],
-            style="dim" if is_bench else None,
-        )
+            f"{row['ownership']:.0f}",
+        ]
+        projection = projections.get(row["id"])
+        if has_results_model:
+            clean_sheet = projection.clean_sheet_probability if projection else None
+            involvement = projection.expected_goal_involvement if projection else None
+            cells.append(f"{clean_sheet * 100:.0f}" if clean_sheet is not None else "-")
+            cells.append(f"{involvement:.2f}"[:4] if involvement is not None else "-")
+        else:
+            cells.append(row["set_piece"])
+
+        table.add_row(*cells, style="dim" if is_bench else None)
     return table
 
 
@@ -326,7 +347,18 @@ def main(argv: list[str] | None = None) -> int:
     # --- Project ------------------------------------------------------- #
     scorer = scoring.build_scorer(bootstrap, fixtures, summaries, args.model)
     projections = scorer.project(horizon)
-    console.print(f"[dim]Model: {scorer.name}[/dim]\n")
+    sample = next(iter(projections.values()), None)
+    console.print(f"[dim]Model: {sample.model if sample else scorer.name}[/dim]")
+
+    finished = len(dixon_coles.finished_matches(fixtures))
+    if finished < dixon_coles.MIN_MATCHES_TO_FIT:
+        console.print(
+            f"[dim]Results model: not fitted — {finished} finished matches, "
+            f"needs {dixon_coles.MIN_MATCHES_TO_FIT}. "
+            f"Using fixture difficulty instead.[/dim]\n"
+        )
+    else:
+        console.print("")
 
     locked = [resolve_player(t, players) for t in args.lock]
     banned = [resolve_player(t, players) for t in args.ban]

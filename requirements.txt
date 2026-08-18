@@ -3,4 +3,6 @@ requests>=2.31
 # which optimizer.py uses. Upgrading requires migrating to the add_variable API.
 pulp>=3.0,<4.0
 pandas>=2.0
+# Used only by fpl/dixon_coles.py, for L-BFGS-B likelihood maximisation.
+scipy>=1.10
 rich>=13.0
