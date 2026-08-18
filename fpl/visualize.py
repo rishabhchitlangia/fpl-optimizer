@@ -54,8 +54,13 @@ class PitchMeta:
 
 
 def _player_card(row: dict, projection: Projection | None,
-                 is_captain: bool, is_vice: bool) -> str:
-    """Render one player as a shirt card."""
+                 is_captain: bool, is_vice: bool,
+                 interactive: bool = False) -> str:
+    """Render one player as a shirt card.
+
+    In interactive mode the card becomes a real button so it is reachable by
+    keyboard and announced correctly, rather than a div with a click handler.
+    """
     classes = ["player"]
     if is_captain:
         classes.append("is-captain")
@@ -83,8 +88,7 @@ def _player_card(row: dict, projection: Projection | None,
         extras.append(f'<span class="stat"><span class="stat-key">own</span>'
                       f'{row["ownership"]:.0f}%</span>')
 
-    return f"""
-        <div class="{' '.join(classes)}">
+    inner = f"""
           {badge}
           <div class="shirt" aria-hidden="true"></div>
           <div class="name">{html.escape(row['name'])}</div>
@@ -93,14 +97,34 @@ def _player_card(row: dict, projection: Projection | None,
             <span class="price">£{row['price']:.1f}</span>
           </div>
           <div class="points">{row['predicted']:.2f}</div>
-          <div class="stats">{''.join(extras)}{flag_html}</div>
-        </div>"""
+          <div class="stats">{''.join(extras)}{flag_html}</div>"""
+
+    if not interactive:
+        return f'<div class="{" ".join(classes)}">{inner}</div>'
+
+    classes.append("player--selectable")
+    return (f'<button type="button" class="{" ".join(classes)}" '
+            f'data-player-id="{row["id"]}" aria-pressed="false" '
+            f'title="Click to swap {html.escape(row["name"])} out">'
+            f'<span class="tick" aria-hidden="true"></span>{inner}</button>')
 
 
-def _bench_card(row: dict) -> str:
+def _bench_card(row: dict, interactive: bool = False) -> str:
     """Render one bench player, deliberately quieter than a starter."""
     flag = STATUS_LABELS.get(row["status"], "")
     flag_html = f'<span class="flag">{html.escape(flag)}</span>' if flag else ""
+    if interactive:
+        return f"""
+        <button type="button" class="bench-player bench-player--selectable"
+                data-player-id="{row['id']}" aria-pressed="false"
+                title="Click to swap {html.escape(row['name'])} out">
+          <span class="bench-pos">{html.escape(row['position'])}</span>
+          <span class="bench-name">{html.escape(row['name'])}</span>
+          <span class="bench-club">{html.escape(row['team'])}</span>
+          <span class="bench-price">£{row['price']:.1f}</span>
+          <span class="bench-points">{row['predicted']:.2f}</span>
+          {flag_html}
+        </button>"""
     return f"""
         <div class="bench-player">
           <span class="bench-pos">{html.escape(row['position'])}</span>
@@ -460,15 +484,265 @@ def _styles() -> str:
       .bench-club { display: none; }
     }
 
+    /* --- Interactive mode ------------------------------------------------ */
+
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 12px 16px;
+    }
+    .controls-text { flex: 1 1 220px; font-size: 14px; color: var(--muted); }
+    .controls-text strong { color: var(--ink); font-weight: 600; }
+
+    button.btn {
+      font-family: "Barlow", sans-serif;
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      padding: 9px 16px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--ink);
+      cursor: pointer;
+    }
+    button.btn:hover:not(:disabled) { border-color: var(--muted); }
+    button.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    button.btn--primary {
+      background: var(--pitch);
+      border-color: var(--pitch);
+      color: #F4FAF4;
+    }
+    button.btn--primary:hover:not(:disabled) { background: var(--pitch-deep); }
+
+    :focus-visible { outline: 2px solid var(--captain); outline-offset: 2px; }
+
+    button.player--selectable,
+    button.bench-player--selectable {
+      font: inherit;
+      background: none;
+      border: none;
+      cursor: pointer;
+      padding: 4px 2px;
+      border-radius: 8px;
+      text-align: inherit;
+      color: inherit;
+    }
+    button.player--selectable { text-align: center; }
+    button.bench-player--selectable {
+      width: 100%;
+      border-bottom: 1px solid var(--line);
+      border-radius: 0;
+      padding: 9px 16px;
+    }
+    button.player--selectable:hover { background: rgba(255, 255, 255, 0.07); }
+    button.bench-player--selectable:hover { background: var(--bg); }
+
+    .tick {
+      position: absolute;
+      top: -6px;
+      left: 10px;
+      z-index: 2;
+      width: 17px;
+      height: 17px;
+      border-radius: 50%;
+      border: 1px solid var(--on-pitch-muted);
+      background: rgba(0, 0, 0, 0.25);
+      opacity: 0;
+    }
+    button.player--selectable:hover .tick { opacity: 0.6; }
+
+    [aria-pressed="true"].player--selectable {
+      background: rgba(240, 180, 41, 0.16);
+      box-shadow: inset 0 0 0 1px var(--captain);
+    }
+    [aria-pressed="true"] .tick {
+      opacity: 1;
+      background: var(--captain);
+      border-color: var(--captain);
+    }
+    [aria-pressed="true"] .tick::after {
+      content: "";
+      position: absolute;
+      left: 5px;
+      top: 2px;
+      width: 4px;
+      height: 8px;
+      border: solid #1A1200;
+      border-width: 0 2px 2px 0;
+      transform: rotate(45deg);
+    }
+    [aria-pressed="true"].bench-player--selectable {
+      background: rgba(240, 180, 41, 0.12);
+      box-shadow: inset 2px 0 0 var(--captain);
+    }
+
+    .changes {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-left: 3px solid var(--captain);
+      border-radius: 10px;
+      padding: 12px 16px;
+      font-size: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+    .changes h2 {
+      font-family: "Barlow", sans-serif;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin: 0 0 2px;
+    }
+    .change-row { font-variant-numeric: tabular-nums; }
+    .change-out { color: var(--muted); text-decoration: line-through; }
+    .delta-up { color: var(--pitch); font-weight: 600; }
+    :root[data-theme="dark"] .delta-up,
+    :root:not([data-theme="light"]) .delta-up { color: #6FCF97; }
+    @media (prefers-color-scheme: light) {
+      :root:not([data-theme="dark"]) .delta-up { color: var(--pitch); }
+    }
+    .delta-down { color: #C2410C; font-weight: 600; }
+
+    .is-busy { opacity: 0.5; pointer-events: none; }
+
+    .error {
+      background: var(--surface);
+      border: 1px solid #C2410C;
+      border-radius: 10px;
+      padding: 12px 16px;
+      font-size: 14px;
+      color: #C2410C;
+    }
+
     @media (prefers-reduced-motion: reduce) {
       * { transition: none !important; animation: none !important; }
     }
     """
 
 
+def _script() -> str:
+    """Client-side behaviour for the interactive pitch.
+
+    Deliberately small and dependency-free. Selection state lives in the DOM
+    (``aria-pressed``) rather than a parallel JavaScript structure, so the
+    accessible state and the visual state cannot drift apart.
+
+    The page never computes a squad itself — it posts the selected players to
+    the local server, which runs the real optimizer and returns fully rendered
+    markup. That keeps exactly one implementation of the optimisation logic.
+    """
+    return """
+    (function () {
+      var wrap = document.querySelector('.wrap');
+
+      function selected() {
+        return Array.from(
+          document.querySelectorAll('[data-player-id][aria-pressed="true"]')
+        ).map(function (el) { return Number(el.dataset.playerId); });
+      }
+
+      function refreshControls() {
+        var count = selected().length;
+        var button = document.getElementById('reoptimise');
+        var reset = document.getElementById('reset');
+        var text = document.getElementById('controls-text');
+        if (!button) { return; }
+        button.disabled = count === 0;
+        if (reset) { reset.disabled = count === 0; }
+        button.textContent = count > 1
+          ? 'Replace ' + count + ' players'
+          : 'Replace player';
+        if (text) {
+          text.innerHTML = count === 0
+            ? 'Click any player to swap them out.'
+            : '<strong>' + count + '</strong> selected \u2014 everyone else stays.';
+        }
+      }
+
+      function toggle(el) {
+        el.setAttribute('aria-pressed',
+          el.getAttribute('aria-pressed') === 'true' ? 'false' : 'true');
+        refreshControls();
+      }
+
+      function bind() {
+        document.querySelectorAll('[data-player-id]').forEach(function (el) {
+          el.addEventListener('click', function () { toggle(el); });
+        });
+
+        var button = document.getElementById('reoptimise');
+        if (button) { button.addEventListener('click', reoptimise); }
+
+        var reset = document.getElementById('reset');
+        if (reset) {
+          reset.addEventListener('click', function () {
+            document.querySelectorAll('[data-player-id]').forEach(function (el) {
+              el.setAttribute('aria-pressed', 'false');
+            });
+            refreshControls();
+          });
+        }
+
+        var revert = document.getElementById('revert');
+        if (revert) { revert.addEventListener('click', function () { post([], true); }); }
+
+        refreshControls();
+      }
+
+      function reoptimise() { post(selected(), false); }
+
+      function post(replace, revert) {
+        var keep = Array.from(document.querySelectorAll('[data-player-id]'))
+          .map(function (el) { return Number(el.dataset.playerId); })
+          .filter(function (id) { return replace.indexOf(id) === -1; });
+
+        wrap.classList.add('is-busy');
+        fetch('/api/optimise', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ replace: replace, keep: keep, revert: !!revert })
+        })
+          .then(function (response) {
+            if (!response.ok) { return response.json().then(function (e) { throw e; }); }
+            return response.json();
+          })
+          .then(function (data) {
+            wrap.outerHTML = data.html;
+            wrap = document.querySelector('.wrap');
+            bind();
+          })
+          .catch(function (error) {
+            wrap.classList.remove('is-busy');
+            var box = document.getElementById('error');
+            if (box) {
+              box.textContent = error && error.error
+                ? error.error
+                : 'Could not reach the optimizer. Is the server still running?';
+              box.hidden = false;
+            }
+          });
+      }
+
+      bind();
+    })();
+    """
+
+
 def render_squad_html(selection: SquadSelection, bootstrap: dict,
                       projections: dict[int, Projection],
-                      meta: PitchMeta, standalone: bool = True) -> str:
+                      meta: PitchMeta, standalone: bool = True,
+                      interactive: bool = False,
+                      changes: list[dict] | None = None,
+                      baseline_points: float | None = None) -> str:
     """Render a squad selection as an HTML pitch view.
 
     Args:
@@ -477,6 +751,12 @@ def render_squad_html(selection: SquadSelection, bootstrap: dict,
         projections: Predicted points keyed by player ID.
         meta: Header context.
         standalone: Emit a complete HTML document. Set ``False`` for a fragment.
+        interactive: Make players clickable and add the replace controls. Only
+            meaningful when served by :mod:`fpl.server`, which supplies the
+            endpoint the controls post to.
+        changes: Swaps applied to reach this squad, each with ``out``, ``in``
+            and ``delta`` keys, rendered as a change list.
+        baseline_points: Projected points before those swaps, for the delta.
 
     Returns:
         HTML source.
@@ -495,12 +775,14 @@ def render_squad_html(selection: SquadSelection, bootstrap: dict,
         cards = "".join(
             _player_card(by_id[pid], projections.get(pid),
                          pid == selection.captain_id,
-                         pid == selection.vice_captain_id)
+                         pid == selection.vice_captain_id,
+                         interactive)
             for pid in in_row
         )
         pitch_rows.append(f'<div class="row">{cards}</div>')
 
-    bench_cards = "".join(_bench_card(by_id[pid]) for pid in selection.bench_ids)
+    bench_cards = "".join(_bench_card(by_id[pid], interactive)
+                          for pid in selection.bench_ids)
     bench_total = sum(by_id[pid]["predicted"] for pid in selection.bench_ids)
 
     horizon_label = (f"{meta.horizon} gameweeks" if meta.horizon > 1
@@ -510,6 +792,45 @@ def render_squad_html(selection: SquadSelection, bootstrap: dict,
         shape_tag = f'<span class="tag tag--alert">{html.escape(meta.gameweek_shape)}</span>'
     deadline_tag = (f'<span class="tag">{html.escape(meta.deadline)}</span>'
                     if meta.deadline else "")
+
+    controls_html = ""
+    if interactive:
+        controls_html = """
+      <section class="controls">
+        <div class="controls-text" id="controls-text">
+          Click any player to swap them out.
+        </div>
+        <button type="button" class="btn" id="reset" disabled>Clear</button>
+        <button type="button" class="btn" id="revert">Reset squad</button>
+        <button type="button" class="btn btn--primary" id="reoptimise" disabled>
+          Replace player
+        </button>
+      </section>
+      <div class="error" id="error" hidden></div>"""
+
+    changes_html = ""
+    if changes:
+        rows = []
+        for change in changes:
+            delta = change.get("delta", 0.0)
+            css = "delta-up" if delta >= 0 else "delta-down"
+            rows.append(
+                f'<div class="change-row">'
+                f'<span class="change-out">{html.escape(change["out"])}</span>'
+                f' &rarr; <strong>{html.escape(change["in"])}</strong> '
+                f'<span class="{css}">{delta:+.2f}</span></div>'
+            )
+        total = ""
+        if baseline_points is not None:
+            difference = selection.predicted_points - baseline_points
+            css = "delta-up" if difference >= 0 else "delta-down"
+            total = (f'<div class="change-row">Squad total '
+                     f'<span class="{css}">{difference:+.2f}</span> '
+                     f'against the original.</div>')
+        changes_html = (f'<section class="changes"><h2>Changes applied</h2>'
+                        f'{"".join(rows)}{total}</section>')
+
+    script_html = f"<script>{_script()}</script>" if interactive else ""
 
     body = f"""
     <div class="wrap">
@@ -522,6 +843,9 @@ def render_squad_html(selection: SquadSelection, bootstrap: dict,
         </div>
         <h1>{html.escape(meta.title)}</h1>
       </header>
+
+      {controls_html}
+      {changes_html}
 
       <section class="summary">
         <div class="tile">
@@ -559,7 +883,8 @@ def render_squad_html(selection: SquadSelection, bootstrap: dict,
         the <code>{html.escape(meta.model or 'projection')}</code> model, not
         predictions — check team news before the deadline.
       </footer>
-    </div>"""
+    </div>
+    {script_html}"""
 
     head = f"""<title>{html.escape(meta.title)}</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">

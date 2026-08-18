@@ -112,6 +112,8 @@ That comparison is the whole point.
 | `--ban` | — | Exclude a player. Repeatable |
 | `--max-ownership` | — | Only pick players below this ownership %. Differential mode |
 | `--min-availability` | `0.0` | Drop players below this fitness. `1.0` avoids all doubts |
+| `--serve` | — | Open an interactive pitch for swapping players (port 8000) |
+| `--replace` | — | Swap a player out and re-optimise. Repeatable |
 | `--html` | — | Also write an HTML pitch view to this path |
 | `--refresh` | off | Force re-fetch of all cached data |
 | `--no-history` | off | Skip the 590-request history sweep (weaker model) |
@@ -120,6 +122,38 @@ That comparison is the whole point.
 python main.py --lock Haaland --ban Gabriel --horizon 6
 python main.py --refresh --min-availability 1.0
 python main.py --max-ownership 15          # differential squad
+```
+
+### Editing the squad interactively
+
+If you disagree with a pick, click it:
+
+```bash
+python main.py --serve
+```
+
+That opens a pitch in your browser where every player is clickable. Select the
+ones you want gone, press **Replace**, and the squad is re-solved around your
+choices — the players you kept stay put, the rejected ones are swapped for the
+best legal alternatives, and a change list shows what moved and what it cost.
+
+The click goes to a small local server that runs the **real optimizer**. That
+round-trip is the point: a static page cannot run a mixed-integer solver, so a
+purely client-side version could only offer precomputed swaps. Going through
+the server means every suggestion is genuinely optimal under the same
+constraints as the command line — one implementation of the logic, not two.
+
+Rejections accumulate. Once you have said you don't want a player they stay out
+until you press **Reset squad**, so the optimizer can't immediately re-sign
+someone you just rejected.
+
+The server binds to `127.0.0.1` only and is meant for local use while you plan a
+gameweek. It is not hardened for exposure to a network.
+
+For the same thing without a browser:
+
+```bash
+python main.py --replace Haaland --replace Raya
 ```
 
 ### Seeing the team on a pitch
@@ -338,8 +372,9 @@ fpl/
   transfers.py    Transfer plan generation and ranking, net of hits
   chips.py        Chip heuristics and blank/double gameweek detection
   visualize.py    HTML pitch view of a squad
+  server.py       Local server for the interactive squad editor
 main.py           CLI
-tests/            84 tests, live cached data + simulated seasons
+tests/            104 tests, live data + simulated seasons + live server
 RULES.md          Researched 2026/27 rules, with citations
 data/cache/       Cached API responses (gitignored)
 ```
@@ -352,7 +387,7 @@ data/cache/       Cached API responses (gitignored)
 python -m unittest discover -s tests -v
 ```
 
-84 tests covering the sell-on fee, formation enumeration, squad legality
+104 tests covering the sell-on fee, formation enumeration, squad legality
 (size, positions, budget, 3-per-club), captain selection, transfer hit
 arithmetic, and chip availability windows. They run against live cached data,
 so they double as an assertion that the API still matches RULES.md — if FPL

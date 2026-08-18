@@ -31,7 +31,7 @@ from pathlib import Path
 
 from fpl import chips as chips_module
 from fpl import dixon_coles
-from fpl import data, optimizer, scoring, transfers, visualize
+from fpl import data, optimizer, scoring, server, transfers, visualize
 
 console = Console()
 
@@ -107,6 +107,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-availability", type=float, default=0.0,
         help="Exclude players below this availability, 0.0-1.0. Use 1.0 to "
              "avoid every doubtful player.",
+    )
+    parser.add_argument(
+        "--serve", nargs="?", type=int, const=8000, default=None,
+        metavar="PORT",
+        help="Open an interactive pitch in your browser where you can click "
+             "players to swap out and have the squad re-optimised around your "
+             "choices. Defaults to port 8000.",
+    )
+    parser.add_argument(
+        "--replace", action="append", default=[], metavar="PLAYER",
+        help="Swap this player out of the suggested squad and re-optimise "
+             "around the rest. Name or ID. Repeatable.",
     )
     parser.add_argument(
         "--html", metavar="PATH", default=None,
@@ -394,8 +406,51 @@ def main(argv: list[str] | None = None) -> int:
         console.print(f"[red]Optimizer failed:[/red] {exc}")
         return 1
 
-    console.print(render_squad(ideal, bootstrap, projections,
-                               "Optimal squad (from scratch)"))
+    baseline = ideal
+    replaced = [resolve_player(t, players) for t in args.replace]
+    if replaced:
+        missing = [p for p in replaced if p not in set(ideal.squad_ids)]
+        for pid in missing:
+            console.print(
+                f"[yellow]{players[pid]['web_name']} is not in the suggested "
+                f"squad; excluding them anyway.[/yellow]"
+            )
+        try:
+            with console.status("Re-optimising around your choices..."):
+                ideal = optimizer.optimize_squad(
+                    bootstrap, projections, budget=budget,
+                    locked=[p for p in ideal.squad_ids if p not in set(replaced)],
+                    banned=banned + replaced,
+                    min_availability=args.min_availability,
+                )
+        except optimizer.OptimizerError as exc:
+            console.print(
+                f"[red]No valid squad with those players removed:[/red] {exc}\n"
+                f"[dim]Try removing fewer at once, or freeing a locked player.[/dim]"
+            )
+            return 1
+
+        console.print(render_squad(ideal, bootstrap, projections,
+                                   "Squad after your replacements"))
+        # Pair by position so the list reads naturally (GK with GK, and so on)
+        # rather than by arbitrary player ID.
+        def by_position(pid: int) -> tuple[int, int]:
+            return (players[pid]["element_type"], pid)
+
+        out = sorted(set(baseline.squad_ids) - set(ideal.squad_ids), key=by_position)
+        into = sorted(set(ideal.squad_ids) - set(baseline.squad_ids), key=by_position)
+        for gone, arrived in zip(out, into):
+            console.print(f"  [dim]{players[gone]['web_name']}[/dim] → "
+                          f"[bold]{players[arrived]['web_name']}[/bold]")
+        difference = ideal.predicted_points - baseline.predicted_points
+        colour = "green" if difference >= 0 else "yellow"
+        console.print(
+            f"Projected [bold {colour}]{difference:+.2f}[/bold {colour}] "
+            f"against the original suggestion.\n"
+        )
+    else:
+        console.print(render_squad(ideal, bootstrap, projections,
+                                   "Optimal squad (from scratch)"))
     console.print(
         f"Cost [bold]£{ideal.total_cost / 10:.1f}m[/bold]  ·  "
         f"formation [bold]{ideal.formation}[/bold]  ·  "
@@ -467,6 +522,36 @@ def main(argv: list[str] | None = None) -> int:
         suggested_transfers=suggested,
     )
     console.print(render_chips(flags))
+
+    if args.serve is not None:
+        deadline = next((e["deadline_time"] for e in bootstrap["events"]
+                         if e["id"] == gameweek), None)
+        editor = server.SquadEditor(
+            bootstrap, projections, ideal,
+            visualize.PitchMeta(
+                gameweek=gameweek,
+                horizon=len(horizon),
+                model=sample.model if sample else scorer.name,
+                deadline=(deadline or "").replace("T", " ").replace("Z", " UTC") or None,
+                gameweek_shape=shape["label"],
+                title="Squad Editor",
+            ),
+            budget=budget,
+            min_availability=args.min_availability,
+        )
+        console.print(
+            f"\n[green]Squad editor running at[/green] "
+            f"http://127.0.0.1:{args.serve}/\n"
+            f"[dim]Click players to swap them out, then press Replace. "
+            f"Ctrl-C to stop.[/dim]"
+        )
+        try:
+            server.serve(editor, port=args.serve)
+        except OSError as exc:
+            console.print(f"[red]Could not start the server:[/red] {exc}")
+            return 1
+        console.print("[dim]Editor stopped.[/dim]")
+        return 0
 
     if args.html:
         deadline = next((e["deadline_time"] for e in bootstrap["events"]
