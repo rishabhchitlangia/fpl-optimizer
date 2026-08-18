@@ -27,9 +27,11 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from pathlib import Path
+
 from fpl import chips as chips_module
 from fpl import dixon_coles
-from fpl import data, optimizer, scoring, transfers
+from fpl import data, optimizer, scoring, transfers, visualize
 
 console = Console()
 
@@ -105,6 +107,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-availability", type=float, default=0.0,
         help="Exclude players below this availability, 0.0-1.0. Use 1.0 to "
              "avoid every doubtful player.",
+    )
+    parser.add_argument(
+        "--html", metavar="PATH", default=None,
+        help="Also write the suggested squad to an HTML pitch view at PATH, "
+             "which you can open in any browser.",
     )
     parser.add_argument(
         "--refresh", action="store_true",
@@ -460,6 +467,25 @@ def main(argv: list[str] | None = None) -> int:
         suggested_transfers=suggested,
     )
     console.print(render_chips(flags))
+
+    if args.html:
+        deadline = next((e["deadline_time"] for e in bootstrap["events"]
+                         if e["id"] == gameweek), None)
+        page = visualize.render_squad_html(
+            ideal, bootstrap, projections,
+            visualize.PitchMeta(
+                gameweek=gameweek,
+                horizon=len(horizon),
+                model=sample.model if sample else scorer.name,
+                deadline=(deadline or "").replace("T", " ").replace("Z", " UTC") or None,
+                gameweek_shape=shape["label"],
+                title="Suggested Squad",
+            ),
+        )
+        path = Path(args.html)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(page, encoding="utf-8")
+        console.print(f"\n[green]Pitch view written to[/green] {path}")
 
     console.print(
         "\n[dim]Projections are estimates, not predictions. See RULES.md for the "

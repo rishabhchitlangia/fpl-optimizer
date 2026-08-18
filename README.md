@@ -112,6 +112,7 @@ That comparison is the whole point.
 | `--ban` | — | Exclude a player. Repeatable |
 | `--max-ownership` | — | Only pick players below this ownership %. Differential mode |
 | `--min-availability` | `0.0` | Drop players below this fitness. `1.0` avoids all doubts |
+| `--html` | — | Also write an HTML pitch view to this path |
 | `--refresh` | off | Force re-fetch of all cached data |
 | `--no-history` | off | Skip the 590-request history sweep (weaker model) |
 
@@ -120,6 +121,23 @@ python main.py --lock Haaland --ban Gabriel --horizon 6
 python main.py --refresh --min-availability 1.0
 python main.py --max-ownership 15          # differential squad
 ```
+
+### Seeing the team on a pitch
+
+Terminal tables are good for numbers but bad for *shape* — whether the defence
+is three or five, which club you are stacked on, where the captaincy sits:
+
+```bash
+python main.py --html squad.html && open squad.html
+```
+
+That writes a self-contained HTML page laying the XI out in its actual
+formation, with the bench below it. No build step, no server, works offline,
+and it follows your system light/dark theme. Nothing to install.
+
+There is no third-party site that takes this tool's output — to actually enter
+the team you use [fantasy.premierleague.com](https://fantasy.premierleague.com)
+and its Pick Team page.
 
 The squad table's `Own%` column shows ownership and `SP` flags set-piece duty
 (`P` penalties, `S` corners/free-kicks), so you can see at a glance how close to
@@ -319,6 +337,7 @@ fpl/
   optimizer.py    MILP squad selection and starting-XI picker
   transfers.py    Transfer plan generation and ranking, net of hits
   chips.py        Chip heuristics and blank/double gameweek detection
+  visualize.py    HTML pitch view of a squad
 main.py           CLI
 tests/            84 tests, live cached data + simulated seasons
 RULES.md          Researched 2026/27 rules, with citations
