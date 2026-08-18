@@ -1,0 +1,13 @@
+# Virtual environment
+.venv/
+venv/
+
+# Cached FPL API responses
+data/cache/
+*.pyc
+__pycache__/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
