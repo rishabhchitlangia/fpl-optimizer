@@ -289,6 +289,26 @@ class TestAvailability(unittest.TestCase):
     def test_fit_player_is_fully_available(self):
         self.assertEqual(scoring.availability({"status": "a"}), 1.0)
 
+    def test_unselectable_players_are_excluded_whatever_their_status(self):
+        """can_select is FPL's direct statement that a player cannot be picked.
+
+        A departed player normally also carries status 'u', but that alignment
+        is incidental and must not be relied on.
+        """
+        self.assertEqual(
+            scoring.availability({"status": "a", "can_select": False}), 0.0)
+        self.assertEqual(
+            scoring.availability({"status": "a", "removed": True}), 0.0)
+
+    def test_live_departures_are_all_excluded(self):
+        """Every player FPL marks unselectable must project zero."""
+        bootstrap = data.get_bootstrap()
+        departed = [p for p in bootstrap["elements"]
+                    if p.get("can_select") is False or p.get("removed")]
+        for player in departed:
+            self.assertEqual(scoring.availability(player), 0.0,
+                             f"{player['web_name']} is still selectable")
+
 
 class TestLiveData(unittest.TestCase):
     """Assertions against the real API payloads."""

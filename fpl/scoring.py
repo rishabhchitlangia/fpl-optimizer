@@ -357,10 +357,27 @@ def fixture_multiplier(difficulty: int, element_type: int) -> float:
 def availability(player: dict) -> float:
     """Return the probability a player is available to feature, 0.0-1.0.
 
-    Uses FPL's ``status`` flag and ``chance_of_playing_next_round``. Injured,
-    suspended and unregistered players return 0.0 so the optimizer will never
-    select them.
+    Injured, suspended and departed players return 0.0 so the optimizer will
+    never select them.
+
+    Three signals, checked in order of authority:
+
+    ``can_select``
+        FPL's own "you cannot put this player in a squad" flag. Checked first
+        and on its own, because it is the direct statement of selectability.
+        During a transfer window it is what marks players who have left the
+        league. Today every such player also carries ``status='u'``, but that
+        alignment is incidental — a player could be made unselectable for a
+        reason the status codes do not cover, and relying on the coincidence
+        would eventually suggest a transfer that cannot be made.
+    ``status``
+        Injury, suspension and registration state.
+    ``chance_of_playing_next_round``
+        A stated percentage, where FPL has published one.
     """
+    if player.get("can_select") is False or player.get("removed"):
+        return 0.0
+
     status = player.get("status", "a")
     if status in UNAVAILABLE_STATUSES:
         return 0.0

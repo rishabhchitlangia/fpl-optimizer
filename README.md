@@ -26,6 +26,37 @@ python main.py
 First run fetches ~590 player histories and takes a minute or two. Everything is
 cached to `data/cache/`, so subsequent runs are near-instant.
 
+### Keeping data current during the transfer window
+
+Squads change daily while the window is open — players leave, new signings are
+added to the game, prices move. Two things keep you current:
+
+**Cache expiry is automatic.** Prices and the player list refresh every 6 hours,
+fixtures every 12, per-player season history daily. Just running the tool
+normally picks up most changes.
+
+**Force it when it matters** — before a deadline, or after a transfer you know
+about:
+
+```bash
+python main.py --refresh
+```
+
+That re-fetches everything including all player histories, so it takes a minute
+or two. For a quicker refresh of just prices and the player list, delete the one
+cache file instead:
+
+```bash
+rm data/cache/bootstrap-static.json      # Windows: del data\cache\bootstrap-static.json
+```
+
+**Departed players are excluded automatically.** FPL marks anyone who has left
+the league with `can_select: false`, and the model reads that directly, so they
+project zero points and the optimizer will never suggest one. New signings
+appear in the player list as soon as FPL adds them and are picked up on the next
+refresh — with no Premier League history, they are projected from their price
+and club strength until they have played (see the model section).
+
 ---
 
 ## Plugging in your team ID
@@ -374,7 +405,7 @@ fpl/
   visualize.py    HTML pitch view of a squad
   server.py       Local server for the interactive squad editor
 main.py           CLI
-tests/            104 tests, live data + simulated seasons + live server
+tests/            106 tests, live data + simulated seasons + live server
 RULES.md          Researched 2026/27 rules, with citations
 data/cache/       Cached API responses (gitignored)
 ```
@@ -387,7 +418,7 @@ data/cache/       Cached API responses (gitignored)
 python -m unittest discover -s tests -v
 ```
 
-104 tests covering the sell-on fee, formation enumeration, squad legality
+106 tests covering the sell-on fee, formation enumeration, squad legality
 (size, positions, budget, 3-per-club), captain selection, transfer hit
 arithmetic, and chip availability windows. They run against live cached data,
 so they double as an assertion that the API still matches RULES.md — if FPL
