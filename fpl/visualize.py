@@ -15,8 +15,11 @@ pass ``standalone=False`` for a document fragment suitable for embedding.
 from __future__ import annotations
 
 import html
+import json
 from dataclasses import dataclass
+from datetime import datetime
 
+from fpl import news as news_module
 from fpl.optimizer import SquadSelection, describe_selection
 from fpl.scoring import POSITION_NAMES, Projection
 
@@ -55,7 +58,7 @@ class PitchMeta:
 
 def _player_card(row: dict, projection: Projection | None,
                  is_captain: bool, is_vice: bool,
-                 interactive: bool = False) -> str:
+                 interactive: bool = False, is_required: bool = False) -> str:
     """Render one player as a shirt card.
 
     In interactive mode the card becomes a real button so it is reachable by
@@ -64,6 +67,8 @@ def _player_card(row: dict, projection: Projection | None,
     classes = ["player"]
     if is_captain:
         classes.append("is-captain")
+    if is_required:
+        classes.append("is-required")
 
     badge = ""
     if is_captain:
@@ -99,14 +104,16 @@ def _player_card(row: dict, projection: Projection | None,
           <div class="points">{row['predicted']:.2f}</div>
           <div class="stats">{''.join(extras)}{flag_html}</div>"""
 
+    pin = '<span class="pin" title="Pinned into the squad">PIN</span>' if is_required else ""
+
     if not interactive:
-        return f'<div class="{" ".join(classes)}">{inner}</div>'
+        return f'<div class="{" ".join(classes)}">{pin}{inner}</div>'
 
     classes.append("player--selectable")
     return (f'<button type="button" class="{" ".join(classes)}" '
             f'data-player-id="{row["id"]}" aria-pressed="false" '
             f'title="Click to swap {html.escape(row["name"])} out">'
-            f'<span class="tick" aria-hidden="true"></span>{inner}</button>')
+            f'<span class="tick" aria-hidden="true"></span>{pin}{inner}</button>')
 
 
 def _bench_card(row: dict, interactive: bool = False) -> str:
@@ -134,6 +141,128 @@ def _bench_card(row: dict, interactive: bool = False) -> str:
           <span class="bench-points">{row['predicted']:.2f}</span>
           {flag_html}
         </div>"""
+
+
+def _news_section(bootstrap: dict, selection: SquadSelection,
+                  when: datetime | None) -> str:
+    """Render team news for the squad, plus notable news elsewhere.
+
+    Squad news comes first and always renders, because a flagged player you own
+    is the thing that actually changes your decision. Below it, flagged players
+    with meaningful ownership — the ones you might be about to buy — so a
+    transfer is not made into an injury.
+    """
+    players = {e["id"]: e for e in bootstrap["elements"]}
+    teams = {t["id"]: t for t in bootstrap["teams"]}
+    squad = set(selection.squad_ids)
+
+    def row(player: dict, in_squad: bool) -> str:
+        flag = news_module.parse_news(player)
+        summary = news_module.describe(flag, when)
+        severity = "news-out"
+        if flag.kind in ("fitness", "other") or "%" in flag.raw:
+            severity = "news-doubt"
+        if flag.kind == "departed":
+            severity = "news-gone"
+        where = "in your squad" if in_squad else f"{player['selected_by_percent']}% owned"
+        return f"""
+          <li class="news-item {severity}">
+            <span class="news-player">{html.escape(player['web_name'])}</span>
+            <span class="news-club">{html.escape(teams[player['team']]['short_name'])}</span>
+            <span class="news-text">{html.escape(flag.raw)}</span>
+            <span class="news-tag">{html.escape(summary or where)}</span>
+          </li>"""
+
+    squad_news = [row(players[pid], True) for pid in selection.squad_ids
+                  if players[pid].get("news")]
+
+    # Ranked by ownership and capped, rather than filtered by a fixed
+    # percentage. Ownership is low across the board pre-season and much higher
+    # by midwinter, so any fixed threshold shows almost nothing in August and
+    # far too much in February.
+    elsewhere = sorted(
+        (p for p in bootstrap["elements"]
+         if p.get("news") and p["id"] not in squad
+         and p.get("can_select") is not False and not p.get("removed")),
+        key=lambda p: -float(p.get("selected_by_percent") or 0),
+    )[:10]
+    other_news = [row(p, False) for p in elsewhere]
+
+    squad_block = (f"<ul class='news-list'>{''.join(squad_news)}</ul>"
+                   if squad_news else
+                   "<p class='news-clear'>No flagged players in this squad.</p>")
+
+    other_block = ""
+    if other_news:
+        other_block = f"""
+        <details class="news-more">
+          <summary>Flagged players elsewhere ({len(other_news)})</summary>
+          <ul class="news-list">{''.join(other_news)}</ul>
+        </details>"""
+
+    return f"""
+      <section class="news">
+        <h2>Team news</h2>
+        {squad_block}
+        {other_block}
+      </section>"""
+
+
+def _pin_section(bootstrap: dict, required: set[int],
+                 projections: dict[int, Projection]) -> str:
+    """Render the must-include control: a search box plus the current pins."""
+    players = {e["id"]: e for e in bootstrap["elements"]}
+    teams = {t["id"]: t for t in bootstrap["teams"]}
+
+    # Only selectable players are offered — there is no point searching for
+    # someone who has left the league.
+    options = []
+    index = []
+    for player in sorted(bootstrap["elements"],
+                         key=lambda p: -float(p.get("selected_by_percent") or 0)):
+        if player.get("can_select") is False or player.get("removed"):
+            continue
+        club = teams[player["team"]]["short_name"]
+        label = (f"{player['web_name']} — {POSITION_NAMES[player['element_type']]} "
+                 f"{club} £{player['now_cost'] / 10:.1f}m")
+        options.append(f'<option value="{html.escape(label)}"></option>')
+        index.append({"id": player["id"], "label": label})
+
+    chips = ""
+    for pid in sorted(required):
+        player = players.get(pid)
+        if not player:
+            continue
+        projection = projections.get(pid)
+        points = f" · {projection.expected_points:.2f}" if projection else ""
+        chips += f"""
+          <button type="button" class="chip" data-unpin="{pid}"
+                  title="Remove this pin">
+            {html.escape(player['web_name'])}
+            <span class="chip-meta">£{player['now_cost'] / 10:.1f}m{points}</span>
+            <span class="chip-x" aria-hidden="true">×</span>
+          </button>"""
+
+    chip_block = (f'<div class="chips">{chips}</div>' if chips else
+                  '<p class="pin-empty">No pinned players. '
+                  'The squad is whatever scores highest.</p>')
+
+    return f"""
+      <section class="pins">
+        <h2>Must include</h2>
+        <p class="pin-help">
+          Pin a player and the squad is rebuilt as the best legal team that
+          contains them — the rest restructures to afford it.
+        </p>
+        <div class="pin-row">
+          <input type="text" id="pin-search" list="player-list" autocomplete="off"
+                 placeholder="Search a player, e.g. Haaland" aria-label="Search for a player to pin">
+          <datalist id="player-list">{''.join(options)}</datalist>
+          <button type="button" class="btn btn--primary" id="pin-add">Pin player</button>
+        </div>
+        {chip_block}
+        <script type="application/json" id="player-index">{json.dumps(index)}</script>
+      </section>"""
 
 
 def _styles() -> str:
@@ -299,6 +428,7 @@ def _styles() -> str:
       z-index: 1;
       display: flex;
       justify-content: center;
+      align-items: flex-start;
       gap: clamp(6px, 2vw, 22px);
       flex-wrap: wrap;
     }
@@ -371,6 +501,9 @@ def _styles() -> str:
       line-height: 1.15;
       letter-spacing: 0.005em;
       margin-top: 3px;
+      /* Reserve two lines so a wrapping name (Calvert-Lewin) does not shove
+         its own stats down out of line with the rest of the row. */
+      min-height: 2.3em;
     }
     .meta {
       display: flex;
@@ -623,6 +756,126 @@ def _styles() -> str:
       color: #C2410C;
     }
 
+    /* --- Team news ------------------------------------------------------- */
+
+    .news, .pins {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px 16px;
+    }
+    .news h2, .pins h2 {
+      font-family: "Barlow", sans-serif;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin: 0 0 10px;
+    }
+    .news-list { list-style: none; margin: 0; padding: 0;
+                 display: flex; flex-direction: column; gap: 7px; }
+    .news-item {
+      display: grid;
+      grid-template-columns: minmax(80px, auto) 34px 1fr auto;
+      align-items: baseline;
+      gap: 10px;
+      font-size: 14px;
+      padding-left: 9px;
+      border-left: 2px solid var(--line);
+    }
+    .news-out   { border-left-color: #C2410C; }
+    .news-doubt { border-left-color: var(--captain); }
+    .news-gone  { border-left-color: var(--muted); }
+    .news-player {
+      font-family: "Barlow Condensed", "Barlow", sans-serif;
+      font-size: 17px;
+      font-weight: 600;
+    }
+    .news-club {
+      font-size: 11px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .news-text { color: var(--muted); }
+    .news-tag {
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 11px;
+      color: var(--ink);
+      white-space: nowrap;
+    }
+    .news-clear { margin: 0; font-size: 14px; color: var(--muted); }
+    .news-more { margin-top: 12px; }
+    .news-more summary {
+      cursor: pointer;
+      font-size: 13px;
+      color: var(--muted);
+      padding: 4px 0;
+    }
+    .news-more[open] summary { margin-bottom: 8px; }
+
+    /* --- Must include ---------------------------------------------------- */
+
+    .pin-help { margin: 0 0 10px; font-size: 13px; color: var(--muted); }
+    .pin-row { display: flex; gap: 8px; flex-wrap: wrap; }
+    #pin-search {
+      flex: 1 1 240px;
+      font-family: "Barlow", sans-serif;
+      font-size: 14px;
+      padding: 9px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: var(--bg);
+      color: var(--ink);
+    }
+    .pin-empty { margin: 10px 0 0; font-size: 13px; color: var(--muted); }
+    .chips { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 11px; }
+    .chip {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 6px;
+      font-family: "Barlow", sans-serif;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 5px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--captain);
+      background: rgba(240, 180, 41, 0.14);
+      color: var(--ink);
+      cursor: pointer;
+    }
+    .chip:hover { background: rgba(240, 180, 41, 0.26); }
+    .chip-meta {
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 11px;
+      font-weight: 400;
+      color: var(--muted);
+    }
+    .chip-x { font-size: 15px; line-height: 1; color: var(--muted); }
+
+    .pin {
+      position: absolute;
+      top: -6px;
+      left: 8px;
+      z-index: 2;
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 8px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      padding: 2px 4px;
+      border-radius: 3px;
+      background: var(--captain);
+      color: #1A1200;
+    }
+    .is-required .shirt { border-color: var(--captain); }
+    button.player--selectable .pin { left: 30px; }
+
+    @media (max-width: 560px) {
+      .news-item { grid-template-columns: 1fr auto; }
+      .news-club, .news-text { display: none; }
+    }
+
     @media (prefers-reduced-motion: reduce) {
       * { transition: none !important; animation: none !important; }
     }
@@ -695,21 +948,69 @@ def _script() -> str:
         var revert = document.getElementById('revert');
         if (revert) { revert.addEventListener('click', function () { post([], true); }); }
 
+        var pinAdd = document.getElementById('pin-add');
+        if (pinAdd) { pinAdd.addEventListener('click', pinPlayer); }
+
+        var pinSearch = document.getElementById('pin-search');
+        if (pinSearch) {
+          pinSearch.addEventListener('keydown', function (event) {
+            if (event.key === 'Enter') { event.preventDefault(); pinPlayer(); }
+          });
+        }
+
+        document.querySelectorAll('[data-unpin]').forEach(function (el) {
+          el.addEventListener('click', function () {
+            send({ action: 'unrequire', unrequire: [Number(el.dataset.unpin)] });
+          });
+        });
+
         refreshControls();
       }
 
       function reoptimise() { post(selected(), false); }
 
-      function post(replace, revert) {
-        var keep = Array.from(document.querySelectorAll('[data-player-id]'))
-          .map(function (el) { return Number(el.dataset.playerId); })
-          .filter(function (id) { return replace.indexOf(id) === -1; });
+      function playerIndex() {
+        var node = document.getElementById('player-index');
+        try { return node ? JSON.parse(node.textContent) : []; }
+        catch (e) { return []; }
+      }
 
+      function pinPlayer() {
+        var input = document.getElementById('pin-search');
+        if (!input || !input.value.trim()) { return; }
+        var wanted = input.value.trim().toLowerCase();
+        var index = playerIndex();
+
+        var match = index.filter(function (p) {
+          return p.label.toLowerCase() === wanted;
+        })[0];
+        if (!match) {
+          // Allow a bare surname, as long as it is unambiguous.
+          var partial = index.filter(function (p) {
+            return p.label.toLowerCase().indexOf(wanted) !== -1;
+          });
+          if (partial.length === 1) { match = partial[0]; }
+          else {
+            showError(partial.length
+              ? 'That matches ' + partial.length + ' players — pick one from the list.'
+              : 'No player matches "' + input.value.trim() + '".');
+            return;
+          }
+        }
+        send({ action: 'require', require: [match.id] });
+      }
+
+      function showError(message) {
+        var box = document.getElementById('error');
+        if (box) { box.textContent = message; box.hidden = false; }
+      }
+
+      function send(payload) {
         wrap.classList.add('is-busy');
         fetch('/api/optimise', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ replace: replace, keep: keep, revert: !!revert })
+          body: JSON.stringify(payload)
         })
           .then(function (response) {
             if (!response.ok) { return response.json().then(function (e) { throw e; }); }
@@ -722,14 +1023,17 @@ def _script() -> str:
           })
           .catch(function (error) {
             wrap.classList.remove('is-busy');
-            var box = document.getElementById('error');
-            if (box) {
-              box.textContent = error && error.error
-                ? error.error
-                : 'Could not reach the optimizer. Is the server still running?';
-              box.hidden = false;
-            }
+            showError(error && error.error
+              ? error.error
+              : 'Could not reach the optimizer. Is the server still running?');
           });
+      }
+
+      function post(replace, revert) {
+        var keep = Array.from(document.querySelectorAll('[data-player-id]'))
+          .map(function (el) { return Number(el.dataset.playerId); })
+          .filter(function (id) { return replace.indexOf(id) === -1; });
+        send({ replace: replace, keep: keep, revert: !!revert });
       }
 
       bind();
@@ -742,7 +1046,8 @@ def render_squad_html(selection: SquadSelection, bootstrap: dict,
                       meta: PitchMeta, standalone: bool = True,
                       interactive: bool = False,
                       changes: list[dict] | None = None,
-                      baseline_points: float | None = None) -> str:
+                      baseline_points: float | None = None,
+                      required: set[int] | None = None) -> str:
     """Render a squad selection as an HTML pitch view.
 
     Args:
@@ -757,6 +1062,8 @@ def render_squad_html(selection: SquadSelection, bootstrap: dict,
         changes: Swaps applied to reach this squad, each with ``out``, ``in``
             and ``delta`` keys, rendered as a change list.
         baseline_points: Projected points before those swaps, for the delta.
+        required: Players pinned into the squad, marked on the pitch and listed
+            in the must-include section.
 
     Returns:
         HTML source.
@@ -764,6 +1071,7 @@ def render_squad_html(selection: SquadSelection, bootstrap: dict,
     rows = describe_selection(selection, bootstrap, projections)
     by_id = {row["id"]: row for row in rows}
     starters = selection.starting_ids
+    required = required or set()
 
     pitch_rows = []
     players = {e["id"]: e for e in bootstrap["elements"]}
@@ -776,7 +1084,7 @@ def render_squad_html(selection: SquadSelection, bootstrap: dict,
             _player_card(by_id[pid], projections.get(pid),
                          pid == selection.captain_id,
                          pid == selection.vice_captain_id,
-                         interactive)
+                         interactive, pid in required)
             for pid in in_row
         )
         pitch_rows.append(f'<div class="row">{cards}</div>')
@@ -832,6 +1140,17 @@ def render_squad_html(selection: SquadSelection, bootstrap: dict,
 
     script_html = f"<script>{_script()}</script>" if interactive else ""
 
+    deadline_time = None
+    if meta.deadline:
+        try:
+            deadline_time = datetime.fromisoformat(
+                meta.deadline.replace(" UTC", "+00:00").replace(" ", "T", 1))
+        except ValueError:
+            deadline_time = None
+
+    news_html = _news_section(bootstrap, selection, deadline_time)
+    pins_html = _pin_section(bootstrap, required, projections) if interactive else ""
+
     body = f"""
     <div class="wrap">
       <header>
@@ -869,6 +1188,9 @@ def render_squad_html(selection: SquadSelection, bootstrap: dict,
       <section class="pitch">
         {''.join(pitch_rows)}
       </section>
+
+      {news_html}
+      {pins_html}
 
       <section class="bench">
         <div class="bench-head">

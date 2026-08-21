@@ -127,6 +127,127 @@ class TestBanAccumulation(EditorTestCase):
             editor.replace(keepers, [])
 
 
+class TestRequiredPlayers(EditorTestCase):
+    """Pinning a player rebuilds the best squad that contains them."""
+
+    def _find(self, name: str) -> int:
+        return next(p["id"] for p in self.bootstrap["elements"]
+                    if p["web_name"] == name)
+
+    def test_pinned_player_appears_in_the_squad(self):
+        editor = self.make_editor()
+        haaland = self._find("Haaland")
+        result = editor.require([haaland])
+        self.assertIn(haaland, result.squad_ids)
+        self.assertIn(haaland, editor.required)
+
+    def test_pinning_an_expensive_player_restructures_the_squad(self):
+        """The rest must be free to change — that is what affording him means."""
+        editor = self.make_editor()
+        haaland = self._find("Haaland")
+        result = editor.require([haaland])
+        changed = set(self.baseline.squad_ids) - set(result.squad_ids)
+        self.assertGreater(len(changed), 0)
+        self.assertLessEqual(
+            sum(self.players[p]["now_cost"] for p in result.squad_ids), 1000)
+
+    def test_pinning_costs_points_but_stays_legal(self):
+        editor = self.make_editor()
+        result = editor.require([self._find("Haaland")])
+        self.assertLessEqual(result.predicted_points,
+                             self.baseline.predicted_points + 1e-6)
+        counts: dict[int, int] = {}
+        for pid in result.squad_ids:
+            position = self.players[pid]["element_type"]
+            counts[position] = counts.get(position, 0) + 1
+        self.assertEqual(counts, {1: 2, 2: 5, 3: 5, 4: 3})
+
+    def test_pins_accumulate(self):
+        editor = self.make_editor()
+        first, second = self._find("Haaland"), self._find("Raya")
+        editor.require([first])
+        result = editor.require([second])
+        self.assertIn(first, result.squad_ids)
+        self.assertIn(second, result.squad_ids)
+
+    def test_unpinning_restores_the_free_optimum(self):
+        editor = self.make_editor()
+        haaland = self._find("Haaland")
+        editor.require([haaland])
+        result = editor.unrequire([haaland])
+        self.assertEqual(editor.required, set())
+        self.assertAlmostEqual(result.predicted_points,
+                               self.baseline.predicted_points, places=4)
+
+    def test_rejecting_a_pinned_player_overrides_the_pin(self):
+        """The newer intent wins, rather than deadlocking."""
+        editor = self.make_editor()
+        haaland = self._find("Haaland")
+        editor.require([haaland])
+        keep = [p for p in editor.current.squad_ids if p != haaland]
+        result = editor.replace([haaland], keep)
+        self.assertNotIn(haaland, result.squad_ids)
+        self.assertNotIn(haaland, editor.required)
+
+    def test_pinning_a_rejected_player_overrides_the_rejection(self):
+        editor = self.make_editor()
+        target = self.baseline.captain_id
+        editor.replace([target], [p for p in self.baseline.squad_ids if p != target])
+        result = editor.require([target])
+        self.assertIn(target, result.squad_ids)
+        self.assertNotIn(target, editor.banned)
+
+    def test_an_unaffordable_set_of_pins_raises(self):
+        """Four premium forwards cannot coexist in one squad."""
+        editor = self.make_editor()
+        priciest = sorted(self.bootstrap["elements"],
+                          key=lambda p: -p["now_cost"])[:9]
+        with self.assertRaises(optimizer.OptimizerError):
+            editor.require([p["id"] for p in priciest])
+
+    def test_reset_clears_pins_as_well_as_rejections(self):
+        editor = self.make_editor()
+        editor.require([self._find("Haaland")])
+        editor.reset()
+        self.assertEqual(editor.required, set())
+        self.assertEqual(editor.banned, set())
+
+
+class TestNewsSection(EditorTestCase):
+    """The team-news panel on the page."""
+
+    def test_news_section_always_renders(self):
+        markup = self.make_editor().render()
+        self.assertIn("Team news", markup)
+
+    def test_squad_news_is_reported_or_explicitly_cleared(self):
+        markup = self.make_editor().render()
+        has_items = "news-item" in markup
+        says_clear = "No flagged players in this squad" in markup
+        self.assertTrue(has_items or says_clear)
+
+    def test_flagged_players_elsewhere_are_listed(self):
+        markup = self.make_editor().render()
+        self.assertIn("Flagged players elsewhere", markup)
+
+    def test_departed_players_are_not_offered_for_pinning(self):
+        """No point searching for someone who has left the league."""
+        markup = self.make_editor().render()
+        departed = [p for p in self.bootstrap["elements"]
+                    if p.get("can_select") is False]
+        if not departed:
+            self.skipTest("nobody currently marked unselectable")
+        index_start = markup.index('id="player-index"')
+        index_block = markup[index_start:index_start + 200000]
+        for player in departed[:5]:
+            self.assertNotIn(f'"id": {player["id"]},', index_block)
+
+    def test_player_index_is_present_for_search(self):
+        markup = self.make_editor().render()
+        self.assertIn('id="player-index"', markup)
+        self.assertIn('id="pin-search"', markup)
+
+
 class TestChangeList(EditorTestCase):
     """The change list is what the user reads to understand what happened."""
 

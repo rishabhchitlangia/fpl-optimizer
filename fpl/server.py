@@ -61,14 +61,67 @@ class SquadEditor:
         self.budget = budget
         self.min_availability = min_availability
         self.banned: set[int] = set()
+        self.required: set[int] = set()
         self._lock = threading.Lock()
 
     def reset(self) -> SquadSelection:
-        """Clear every ban and return to the original squad."""
+        """Clear every ban and requirement and return to the original squad."""
         with self._lock:
             self.banned.clear()
+            self.required.clear()
             self.current = self.baseline
             return self.current
+
+    def require(self, player_ids: Sequence[int]) -> SquadSelection:
+        """Force players into the squad and rebuild the best team around them.
+
+        Unlike :meth:`replace`, this does **not** hold the existing squad in
+        place. Forcing in a premium asset usually means the rest of the squad
+        has to be restructured to afford them, so the whole squad is re-solved
+        subject to the required and banned sets. That is what "the best possible
+        team containing this player" means; locking the other fourteen would
+        either be infeasible or produce a much worse squad.
+
+        Args:
+            player_ids: Players that must appear in the squad.
+
+        Returns:
+            The best squad containing every required player.
+
+        Raises:
+            OptimizerError: if no legal squad contains them all — most often
+                because they cost too much together, or three of them share a
+                club with a fourth already required.
+        """
+        with self._lock:
+            self.required.update(player_ids)
+            # A player cannot be both wanted and rejected; the newer intent wins.
+            self.banned -= self.required
+            selection = optimize_squad(
+                self.bootstrap,
+                self.projections,
+                budget=self.budget,
+                locked=sorted(self.required),
+                banned=sorted(self.banned),
+                min_availability=self.min_availability,
+            )
+            self.current = selection
+            return selection
+
+    def unrequire(self, player_ids: Sequence[int]) -> SquadSelection:
+        """Drop a requirement and re-solve without it."""
+        with self._lock:
+            self.required -= set(player_ids)
+            selection = optimize_squad(
+                self.bootstrap,
+                self.projections,
+                budget=self.budget,
+                locked=sorted(self.required),
+                banned=sorted(self.banned),
+                min_availability=self.min_availability,
+            )
+            self.current = selection
+            return selection
 
     def replace(self, replace_ids: Sequence[int],
                 keep_ids: Sequence[int]) -> SquadSelection:
@@ -88,7 +141,10 @@ class SquadEditor:
         """
         with self._lock:
             self.banned.update(replace_ids)
+            # Explicitly rejecting a player overrides an earlier requirement.
+            self.required -= set(replace_ids)
             locked = [pid for pid in keep_ids if pid not in self.banned]
+            locked = sorted(set(locked) | self.required)
             selection = optimize_squad(
                 self.bootstrap,
                 self.projections,
@@ -134,17 +190,18 @@ class SquadEditor:
             standalone=False, interactive=True,
             changes=self.changes(),
             baseline_points=self.baseline.predicted_points,
+            required=self.required,
         )
 
     def render_page(self) -> str:
         """Render the current squad as a complete HTML document."""
-        fragment = visualize.render_squad_html(
+        return visualize.render_squad_html(
             self.current, self.bootstrap, self.projections, self.meta,
             standalone=True, interactive=True,
             changes=self.changes(),
             baseline_points=self.baseline.predicted_points,
+            required=self.required,
         )
-        return fragment
 
     def body_only(self) -> str:
         """Return just the ``.wrap`` element, for in-place DOM replacement."""
@@ -201,8 +258,18 @@ def _handler_factory(editor: SquadEditor):
                 return
 
             try:
-                if payload.get("revert"):
+                action = payload.get("action", "replace")
+                if payload.get("revert") or action == "reset":
                     editor.reset()
+                elif action == "require":
+                    require = [int(x) for x in payload.get("require", [])]
+                    if not require:
+                        raise ValueError("Choose a player to add.")
+                    if len(require) > MAX_SELECTION:
+                        raise ValueError("That is more players than a squad holds.")
+                    editor.require(require)
+                elif action == "unrequire":
+                    editor.unrequire([int(x) for x in payload.get("unrequire", [])])
                 else:
                     replace = [int(x) for x in payload.get("replace", [])]
                     keep = [int(x) for x in payload.get("keep", [])]
@@ -212,8 +279,11 @@ def _handler_factory(editor: SquadEditor):
                         raise ValueError("That is more players than a squad holds.")
                     editor.replace(replace, keep)
             except OptimizerError as exc:
-                message = (f"No valid squad with those players removed. {exc} "
-                           "Try releasing a lock or removing fewer at once.")
+                message = (
+                    f"No legal squad meets those constraints. {exc} "
+                    "Usually this means the players you have pinned cost too "
+                    "much together, or too many come from one club."
+                )
                 self._send(400, json.dumps({"error": message}).encode(),
                            "application/json")
                 return

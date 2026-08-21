@@ -178,6 +178,26 @@ Rejections accumulate. Once you have said you don't want a player they stay out
 until you press **Reset squad**, so the optimizer can't immediately re-sign
 someone you just rejected.
 
+**Pinning a player in.** The **Must include** panel does the opposite: search for
+anyone, pin them, and the squad is rebuilt as the best legal team that contains
+them. Pinned players carry a `PIN` marker on the pitch and a chip below; click
+the chip to release them.
+
+Note this re-solves the *whole* squad rather than swapping one slot. Forcing in a
+£15.5m striker means the rest has to restructure to afford him, and locking the
+other fourteen would usually be either infeasible or much worse. Pinning Haaland
+into the current squad, for instance, shifts it to 3-4-3 and costs 0.12 projected
+points — cheap, and you would not have known that without asking.
+
+Pins and rejections are opposites of the same idea, so the newer instruction
+wins: pinning someone you previously rejected clears the rejection, and
+rejecting someone you previously pinned clears the pin.
+
+**Team news** sits below the pitch: any flagged player in your squad first,
+then the most-owned flagged players elsewhere, so you don't transfer into an
+injury. It reads the same parsed news the model scores with, so the panel and
+the projection can never disagree.
+
 The server binds to `127.0.0.1` only and is meant for local use while you plan a
 gameweek. It is not hardened for exposure to a network.
 
@@ -449,7 +469,7 @@ fpl/
   visualize.py    HTML pitch view of a squad
   server.py       Local server for the interactive squad editor
 main.py           CLI
-tests/            127 tests, live data + simulated seasons + live server
+tests/            141 tests, live data + simulated seasons + live server
 RULES.md          Researched 2026/27 rules, with citations
 data/cache/       Cached API responses (gitignored)
 ```
@@ -462,7 +482,7 @@ data/cache/       Cached API responses (gitignored)
 python -m unittest discover -s tests -v
 ```
 
-127 tests covering the sell-on fee, formation enumeration, squad legality
+141 tests covering the sell-on fee, formation enumeration, squad legality
 (size, positions, budget, 3-per-club), captain selection, transfer hit
 arithmetic, and chip availability windows. They run against live cached data,
 so they double as an assertion that the API still matches RULES.md — if FPL
