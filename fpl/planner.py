@@ -51,6 +51,7 @@ Deliberate simplifications
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -64,13 +65,37 @@ log = logging.getLogger(__name__)
 #: Maximum free transfers that can be banked (RULES.md §3).
 MAX_FREE_TRANSFERS = 5
 
-#: Candidate pool size per position, before adding the current squad. Tuned so
-#: a five-gameweek plan solves in seconds rather than minutes.
+#: Candidate pool size per position for long horizons, before adding the
+#: current squad. Only applied beyond :data:`FULL_POOL_MAX_HORIZON`.
 POOL_PER_POSITION = {1: 12, 2: 40, 3: 40, 4: 25}
 
+#: Longest horizon solved against the *entire* player pool.
+#:
+#: Measured rather than assumed, against the live 599-player list on this
+#: machine, solving to proven optimality:
+#:
+#: =========  ==========  ===============
+#: Horizon    Full pool   Pruned (121)
+#: =========  ==========  ===============
+#: 5 GW       6s          3s
+#: 6 GW       27s         --
+#: 7 GW       47s         --
+#: 8 GW       >240s (*)   38s
+#: =========  ==========  ===============
+#:
+#: (*) did not reach optimality inside four minutes, and returned a *worse*
+#: plan than the pruned run — which is how the misreported solver status
+#: below was found.
+#:
+#: Cost grows steeply between seven and eight gameweeks, so pruning is only
+#: worth its approximation beyond seven. Below that it costs accuracy for a
+#: few seconds, which is a bad trade.
+FULL_POOL_MAX_HORIZON = 7
+
 #: Solver time limit in seconds. A plan that is 99% of optimal now beats a
-#: proven optimum after the deadline has passed.
-SOLVE_TIME_LIMIT = 120
+#: proven optimum after the deadline has passed — but see
+#: :attr:`TransferPath.hit_time_limit`, because a plan cut short must say so.
+SOLVE_TIME_LIMIT = 240
 
 
 @dataclass
@@ -116,14 +141,23 @@ class TransferPath:
         total_points: Sum of predicted points across the horizon.
         total_hits: Points paid for transfers across the horizon.
         pool_size: How many players the solver was allowed to consider.
+        pruned: Whether the pool was reduced from the full player list.
         status: Solver status string.
+        hit_time_limit: Whether the solver ran out of time. When true the plan
+            is the best found so far, **not** a proven optimum — CBC reports
+            its incumbent as "Optimal" in this case, so this flag is the only
+            reliable signal.
+        solve_seconds: Wall-clock time spent solving.
     """
 
     gameweeks: list[GameweekPlan]
     total_points: float
     total_hits: float
     pool_size: int
+    pruned: bool = False
     status: str = "Optimal"
+    hit_time_limit: bool = False
+    solve_seconds: float = 0.0
 
     @property
     def net_points(self) -> float:
@@ -134,11 +168,18 @@ class TransferPath:
 def _build_pool(bootstrap: dict, projections: dict[int, Projection],
                 gameweeks: Sequence[int],
                 current_squad: Sequence[int],
-                banned: set[int]) -> list[int]:
+                banned: set[int]) -> tuple[list[int], bool]:
     """Select the candidate players the solver may use.
 
-    Ranked by total projected points across the horizon, taking the best few per
-    position, and always including the current squad so holding is possible.
+    Short horizons use every available player, because the full problem solves
+    to proven optimality in well under a minute and pruning would trade
+    accuracy for nothing. Only beyond :data:`FULL_POOL_MAX_HORIZON`, where the
+    solve time climbs steeply, is the pool cut down — ranked by projected points
+    over the horizon, keeping the best few per position, and always including
+    the current squad so holding a player stays possible.
+
+    Returns:
+        The pool, and whether it was pruned.
     """
     players = {e["id"]: e for e in bootstrap["elements"]}
 
@@ -150,6 +191,7 @@ def _build_pool(bootstrap: dict, projections: dict[int, Projection],
 
     pool: set[int] = {pid for pid in current_squad
                       if pid in players and pid not in banned}
+    prune = len(gameweeks) > FULL_POOL_MAX_HORIZON
 
     for position, limit in POOL_PER_POSITION.items():
         ranked = sorted(
@@ -158,9 +200,9 @@ def _build_pool(bootstrap: dict, projections: dict[int, Projection],
              and projections.get(pid) and projections[pid].availability > 0),
             key=horizon_points, reverse=True,
         )
-        pool.update(ranked[:limit])
+        pool.update(ranked[:limit] if prune else ranked)
 
-    return sorted(pool)
+    return sorted(pool), prune
 
 
 def plan_transfers(bootstrap: dict, projections: dict[int, Projection],
@@ -212,7 +254,7 @@ def plan_transfers(bootstrap: dict, projections: dict[int, Projection],
     current = [pid for pid in current_squad if pid in players]
     selling_prices = selling_prices or {}
 
-    pool = _build_pool(bootstrap, projections, gameweeks, current, banned_set)
+    pool, pruned = _build_pool(bootstrap, projections, gameweeks, current, banned_set)
     pool = sorted(set(pool) | (locked_set & set(players)))
     if len(pool) < squad_size:
         raise OptimizerError("Not enough candidate players to field a squad.")
@@ -305,9 +347,23 @@ def plan_transfers(bootstrap: dict, projections: dict[int, Projection],
             problem += squad[pid][gw] == 1
 
     # --- Solve ------------------------------------------------------------ #
+    started = time.monotonic()
     status = problem.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit))
+    elapsed = time.monotonic() - started
     label = pulp.LpStatus[status]
-    if label not in ("Optimal", "Not Solved"):
+
+    # CBC reports its incumbent as "Optimal" when it stops on the time limit,
+    # so the status alone cannot distinguish a proven optimum from a plan that
+    # merely ran out of clock. Wall time is the only reliable signal, and the
+    # difference matters: a truncated solve on a larger pool once returned a
+    # *worse* plan than a pruned one, labelled optimal.
+    timed_out = elapsed >= time_limit * 0.95
+    if timed_out:
+        label = "Time limit"
+        log.warning("Transfer planning stopped on the %ds time limit; the plan "
+                    "is the best found, not a proven optimum.", time_limit)
+
+    if label not in ("Optimal", "Not Solved", "Time limit"):
         raise OptimizerError(
             f"No feasible transfer path (solver status: {label}). "
             "Try a shorter horizon, or release some locks."
@@ -349,7 +405,10 @@ def plan_transfers(bootstrap: dict, projections: dict[int, Projection],
         total_points=total_points,
         total_hits=total_hits,
         pool_size=len(pool),
+        pruned=pruned,
         status=label,
+        hit_time_limit=timed_out,
+        solve_seconds=elapsed,
     )
 
 

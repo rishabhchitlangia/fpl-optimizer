@@ -588,9 +588,21 @@ def main(argv: list[str] | None = None) -> int:
                 f"Across {len(plan_gws)} gameweeks: "
                 f"[bold]{path.total_points:.1f}[/bold] points, "
                 f"[bold]-{path.total_hits:.0f}[/bold] in hits, "
-                f"net [bold green]{path.net_points:.1f}[/bold green]\n"
-                f"[dim]Considered {path.pool_size} candidate players. Prices are "
-                f"held fixed and chips are not planned — see planner.py.[/dim]\n"
+                f"net [bold green]{path.net_points:.1f}[/bold green]"
+            )
+            if path.hit_time_limit:
+                console.print(
+                    "[yellow]The solver ran out of time — this is the best plan "
+                    "found, not a proven optimum.[/yellow] "
+                    "[dim]Try a shorter horizon for a guaranteed answer.[/dim]"
+                )
+            pool_note = (f"pruned to {path.pool_size} candidates"
+                         if path.pruned else
+                         f"all {path.pool_size} candidates considered")
+            console.print(
+                f"[dim]Solved in {path.solve_seconds:.0f}s, {pool_note}. "
+                f"Prices are held fixed and chips are not planned — "
+                f"see planner.py.[/dim]\n"
             )
 
     if args.serve is not None:

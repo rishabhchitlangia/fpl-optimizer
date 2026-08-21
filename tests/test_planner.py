@@ -169,13 +169,48 @@ class TestPlanQuality(PlannerTestCase):
         for plan in path.gameweeks:
             self.assertNotIn(target, plan.squad_ids)
 
-    def test_candidate_pool_is_reported(self):
-        """The pruning is an approximation and must never be silent."""
+    def test_short_horizons_use_the_whole_player_pool(self):
+        """Pruning a five-gameweek plan trades accuracy for a few seconds.
+
+        Measured: the full pool solves five gameweeks to proven optimality in
+        about six seconds, and returns the same plan as a pruned pool. Pruning
+        here was an unmeasured assumption that turned out to be wrong.
+        """
         path = planner.plan_transfers(
             self.bootstrap, self.projections, self.squad, self.HORIZON,
             free_transfers=1, bank=self.bank)
-        self.assertGreater(path.pool_size, 60)
-        self.assertLess(path.pool_size, len(self.players))
+        self.assertFalse(path.pruned)
+        self.assertGreater(path.pool_size, 300)
+
+    def test_pruning_is_reported_when_it_happens(self):
+        """The approximation must never be silent."""
+        pool, pruned = planner._build_pool(
+            self.bootstrap, self.projections, list(range(1, 12)),
+            self.squad, set())
+        self.assertTrue(pruned)
+        self.assertLess(len(pool), len(self.players))
+
+    def test_a_truncated_solve_is_flagged_rather_than_called_optimal(self):
+        """CBC labels its incumbent "Optimal" when it stops on the clock.
+
+        Regression: a truncated solve on a larger pool once returned a *worse*
+        plan than a pruned one while reporting optimality, which is how this
+        was found. Wall time is the only reliable signal.
+        """
+        path = planner.plan_transfers(
+            self.bootstrap, self.projections, self.squad,
+            list(range(1, 9)), free_transfers=1, bank=self.bank,
+            time_limit=2)
+        self.assertTrue(path.hit_time_limit)
+        self.assertEqual(path.status, "Time limit")
+
+    def test_an_untruncated_solve_is_not_flagged(self):
+        path = planner.plan_transfers(
+            self.bootstrap, self.projections, self.squad, self.HORIZON,
+            free_transfers=1, bank=self.bank)
+        self.assertFalse(path.hit_time_limit)
+        self.assertEqual(path.status, "Optimal")
+        self.assertGreater(path.solve_seconds, 0.0)
 
 
 class TestEdgeCases(PlannerTestCase):

@@ -261,9 +261,25 @@ Three simplifications, all deliberate and all reported in the output:
 - **Chips are not planned.** Wildcards and Free Hits change the transfer rules
   entirely, and the blank/double calendar is not knowable this far ahead.
   `chips.py` still flags them week to week.
-- **The candidate pool is pruned** to the current squad plus the best few dozen
-  per position — every player at every gameweek would be tens of thousands of
-  binaries. The pool size is printed so the approximation is never silent.
+- **The candidate pool is pruned, but only past seven gameweeks.** Solve times
+  were measured, not assumed:
+
+  | Horizon | Full pool (509) | Pruned (121) |
+  |---|---|---|
+  | 5 GW | 6s | 3s |
+  | 6 GW | 27s | — |
+  | 7 GW | 47s | — |
+  | 8 GW | over 240s, no optimum | 38s |
+
+  Cost climbs steeply between seven and eight gameweeks, so up to seven the
+  planner uses **every** player and pruning would trade accuracy for a few
+  seconds. Beyond that it prunes, and says so in the output.
+
+- **A solve that runs out of time says so.** CBC reports its best incumbent as
+  `Optimal` when it stops on the clock, so the status alone cannot tell a proven
+  optimum from a truncated search — wall time is the only reliable signal. This
+  matters: during testing, a truncated full-pool solve returned a *worse* plan
+  than a pruned one while claiming optimality.
 
 ### Seeing the team on a pitch
 
@@ -528,7 +544,7 @@ fpl/
   server.py       Local server for the interactive squad editor
   planner.py      Multi-gameweek transfer planning (multi-period MILP)
 main.py           CLI
-tests/            159 tests, live data + simulated seasons + live server
+tests/            162 tests, live data + simulated seasons + live server
 RULES.md          Researched 2026/27 rules, with citations
 data/cache/       Cached API responses (gitignored)
 ```
@@ -541,7 +557,7 @@ data/cache/       Cached API responses (gitignored)
 python -m unittest discover -s tests -v
 ```
 
-159 tests covering the sell-on fee, formation enumeration, squad legality
+162 tests covering the sell-on fee, formation enumeration, squad legality
 (size, positions, budget, 3-per-club), captain selection, transfer hit
 arithmetic, and chip availability windows. They run against live cached data,
 so they double as an assertion that the API still matches RULES.md — if FPL
