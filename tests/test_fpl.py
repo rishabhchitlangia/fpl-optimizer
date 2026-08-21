@@ -343,10 +343,45 @@ class TestLiveData(unittest.TestCase):
         self.assertEqual(len(first_half), 4)
 
     def test_unavailable_players_project_zero(self):
+        """Players who cannot feature must project zero.
+
+        Note the qualification. Being flagged ``i`` or ``s`` is no longer
+        sufficient on its own: a player whose news states a return date falling
+        inside the horizon is legitimately worth points from that date, and
+        zeroing them was a real modelling error. What must always be zero is a
+        player with no route back before the fixture — departed, unselectable,
+        or carrying an indefinite absence.
+        """
+        from fpl import news as news_module
+
         for player in self.bootstrap["elements"]:
-            if player["status"] in ("i", "s", "u", "n"):
-                self.assertEqual(self.projections[player["id"]].expected_points, 0.0,
-                                 f"{player['web_name']} is {player['status']}")
+            flag = news_module.parse_news(player)
+            unreachable = (
+                player.get("can_select") is False
+                or player.get("removed")
+                or flag.kind == "departed"
+                or (player["status"] in ("i", "s", "n")
+                    and flag.return_date is None)
+            )
+            if unreachable:
+                self.assertEqual(
+                    self.projections[player["id"]].expected_points, 0.0,
+                    f"{player['web_name']} ({player['status']}) should be zero")
+
+    def test_a_stated_return_date_can_lift_a_flagged_player(self):
+        """The behaviour the previous assertion used to forbid."""
+        from fpl import news as news_module
+
+        returning = [
+            p for p in self.bootstrap["elements"]
+            if p["status"] == "i" and news_module.parse_news(p).return_date
+        ]
+        if not returning:
+            self.skipTest("nobody currently flagged with a return date")
+        # Over a long horizon at least one of them must be worth something.
+        long_horizon = self.scorer.project(list(range(self.gw, min(self.gw + 8, 39))))
+        self.assertGreater(
+            max(long_horizon[p["id"]].expected_points for p in returning), 0.0)
 
     def test_model_discriminates_unlike_ep_next(self):
         """The whole reason the Bayes model exists: ep_next saturates."""

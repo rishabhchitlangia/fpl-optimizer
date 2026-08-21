@@ -48,10 +48,11 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Sequence
 
-from fpl import dixon_coles
+from fpl import dixon_coles, news as news_module
 
 log = logging.getLogger(__name__)
 
@@ -207,12 +208,28 @@ class Projection:
 
 @dataclass(frozen=True)
 class TeamFixture:
-    """One fixture from a specific club's point of view."""
+    """One fixture from a specific club's point of view.
+
+    Carries the kick-off time so availability can be evaluated per fixture —
+    a player due back mid-horizon is unavailable for the earlier gameweeks and
+    available for the later ones.
+    """
 
     gameweek: int
     opponent_id: int
     is_home: bool
     difficulty: int
+    kickoff: datetime | None = None
+
+
+def _parse_kickoff(value: str | None) -> datetime | None:
+    """Parse a fixture kick-off time, tolerating absent or malformed values."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 class FixtureContext:
@@ -230,11 +247,14 @@ class FixtureContext:
             if gw is None:
                 # Postponed with no new date assigned yet.
                 continue
+            kickoff = _parse_kickoff(fx.get("kickoff_time"))
             self._by_team_gw[(fx["team_h"], gw)].append(
-                TeamFixture(gw, fx["team_a"], True, fx.get("team_h_difficulty", 3))
+                TeamFixture(gw, fx["team_a"], True,
+                            fx.get("team_h_difficulty", 3), kickoff)
             )
             self._by_team_gw[(fx["team_a"], gw)].append(
-                TeamFixture(gw, fx["team_h"], False, fx.get("team_a_difficulty", 3))
+                TeamFixture(gw, fx["team_h"], False,
+                            fx.get("team_a_difficulty", 3), kickoff)
             )
 
     def fixtures_for(self, team_id: int, gameweek: int) -> list[TeamFixture]:
@@ -354,7 +374,7 @@ def fixture_multiplier(difficulty: int, element_type: int) -> float:
 # --------------------------------------------------------------------------- #
 
 
-def availability(player: dict) -> float:
+def availability(player: dict, when: datetime | None = None) -> float:
     """Return the probability a player is available to feature, 0.0-1.0.
 
     Injured, suspended and departed players return 0.0 so the optimizer will
@@ -378,12 +398,26 @@ def availability(player: dict) -> float:
     if player.get("can_select") is False or player.get("removed"):
         return 0.0
 
+    # News first, where it can speak to this particular moment. A stated return
+    # date is strictly better information than the structured fields, which
+    # describe only the next gameweek: without it, a player due back in three
+    # days and one due back in three months are indistinguishable.
+    flag = news_module.parse_news(player)
+    from_news = news_module.availability_multiplier(flag, when)
+    if from_news is not None:
+        return from_news
+
     status = player.get("status", "a")
     if status in UNAVAILABLE_STATUSES:
         return 0.0
     chance = player.get("chance_of_playing_next_round")
     if chance is not None:
-        return max(0.0, min(1.0, chance / 100.0))
+        # A percentage that has not been revisited in weeks is not evidence of
+        # much; fall back to the softer default rather than trusting a stale
+        # number precisely.
+        if not flag.is_stale():
+            return max(0.0, min(1.0, chance / 100.0))
+        return 0.75 if status == "d" else 1.0
     # status 'd' (doubtful) with no stated percentage: treat as a coin-flip
     # leaning available, rather than silently assuming full fitness.
     return 0.75 if status == "d" else 1.0
@@ -666,7 +700,7 @@ class EPNextScorer(PlayerScorer):
         projections: dict[int, Projection] = {}
         for player in self.players:
             base = float(player.get("ep_next") or 0.0)
-            avail = availability(player)
+            first_availability: float | None = None
             per_gw: dict[int, float] = {}
             counts: dict[int, int] = {}
             total = 0.0
@@ -674,12 +708,19 @@ class EPNextScorer(PlayerScorer):
             for gw in gameweeks:
                 team_fixtures = self.context.fixtures_for(player["team"], gw)
                 counts[gw] = len(team_fixtures)
-                points = sum(
-                    base * fixture_multiplier(fx.difficulty, player["element_type"])
-                    for fx in team_fixtures
-                ) * avail
+                points = 0.0
+                for fx in team_fixtures:
+                    avail = availability(player, fx.kickoff)
+                    if first_availability is None:
+                        first_availability = avail
+                    points += (base * avail
+                               * fixture_multiplier(fx.difficulty,
+                                                    player["element_type"]))
                 per_gw[gw] = points
                 total += points
+
+            avail = (first_availability if first_availability is not None
+                     else availability(player))
 
             projections[player["id"]] = Projection(
                 player_id=player["id"],
@@ -903,12 +944,11 @@ class BayesianRateScorer(PlayerScorer):
             model_name = f"{self.name}+dixon-coles(w={self.fixture_model.weight:.2f})"
 
         for player in self.players:
-            avail = availability(player)
             rate = self._points_per_90(player)
             minutes = self._expected_minutes(player)
-            per_fixture = avail * (minutes / 90.0) * rate
             involvement_rate = historical_goal_involvement_per_90(
                 self.summaries.get(player["id"]))
+            first_availability: float | None = None
 
             per_gw: dict[int, float] = {}
             counts: dict[int, int] = {}
@@ -925,6 +965,14 @@ class BayesianRateScorer(PlayerScorer):
                 points = 0.0
 
                 for fixture in team_fixtures:
+                    # Availability is evaluated per fixture, so a player due
+                    # back mid-horizon counts for the gameweeks after his
+                    # return and not the ones before it.
+                    avail = availability(player, fixture.kickoff)
+                    if first_availability is None:
+                        first_availability = avail
+                    per_fixture = avail * (minutes / 90.0) * rate
+
                     multiplier = self.fixture_model.multiplier(
                         player["element_type"], player["team"], fixture)
                     points += per_fixture * multiplier
@@ -951,7 +999,8 @@ class BayesianRateScorer(PlayerScorer):
                 fixtures_per_gameweek=counts,
                 points_per_90=rate,
                 expected_minutes=minutes,
-                availability=avail,
+                availability=(first_availability if first_availability is not None
+                              else availability(player)),
                 model=model_name,
                 clean_sheet_probability=(1.0 - concede_all) if saw_clean_sheet_data else None,
                 expected_goal_involvement=involvement if self.fixture_model.has_results_model else None,

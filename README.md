@@ -335,6 +335,49 @@ Because the model cannot be fitted pre-season, it is validated against
 that live data could not have: regularisation crushing every club toward
 average, and `rho` pinning itself to its bound on noise.
 
+### Player news
+
+FPL publishes a short status line for flagged players. The structured fields
+beside it (`status`, `chance_of_playing_next_round`) describe only the **next**
+gameweek, so on their own a player due back in three days and one due back in
+three months are indistinguishable — both simply "unavailable".
+
+`news.py` parses the text to recover what those fields cannot say:
+
+| News | What the model does |
+|---|---|
+| `Ankle injury - Expected back 23 Aug` | Zero until 23 Aug, then ramps back over two weeks |
+| `Suspended until 6 Sep` | Zero until 6 Sep, then available |
+| `Groin injury - Unknown return date` | Zero throughout — no date to count back from |
+| `Has joined Getafe permanently` | Zero always |
+| `Knock - 75% chance of playing` | 0.75, unless the item is over three weeks old |
+
+Availability is therefore evaluated **per fixture**, not once per player. A
+real example from the current data: Baleba is `status='i'` and due back 23
+August — which is the day Brighton play their opening fixture. He scores 0.55
+availability for that match, 0.78 by GW2 and 0.97 by GW3. Treating him as simply
+"injured" would have written him out of the entire horizon.
+
+The ramp exists because published return dates are optimistic: players coming
+back are eased in off the bench, or miss the date altogether.
+
+Two deliberate limits:
+
+- **Unparseable news degrades to "no opinion"**, never to "available". An
+  unrecognised string falls through to the structured fields.
+- **Stale percentages are distrusted.** A "75% chance" that has not been
+  revisited in three weeks is treated as a soft doubt rather than a precise
+  figure.
+
+### What is *not* read
+
+Press-conference reporting, beat writers, and injury-news sites are **not**
+consulted. Only FPL's own `news` field is parsed. Doing more would mean scraping
+sources with no stable format and no guarantee of accuracy, and turning
+free-text football reporting into a number is a much harder and less reliable
+problem than it looks. The model tells you what FPL knows; the last hour before
+a deadline is still yours to read.
+
 ### Swapping in your own model
 
 Subclass `PlayerScorer` and implement one method:
@@ -402,10 +445,11 @@ fpl/
   optimizer.py    MILP squad selection and starting-XI picker
   transfers.py    Transfer plan generation and ranking, net of hits
   chips.py        Chip heuristics and blank/double gameweek detection
+  news.py         Parses FPL player news into per-fixture availability
   visualize.py    HTML pitch view of a squad
   server.py       Local server for the interactive squad editor
 main.py           CLI
-tests/            106 tests, live data + simulated seasons + live server
+tests/            127 tests, live data + simulated seasons + live server
 RULES.md          Researched 2026/27 rules, with citations
 data/cache/       Cached API responses (gitignored)
 ```
@@ -418,7 +462,7 @@ data/cache/       Cached API responses (gitignored)
 python -m unittest discover -s tests -v
 ```
 
-106 tests covering the sell-on fee, formation enumeration, squad legality
+127 tests covering the sell-on fee, formation enumeration, squad legality
 (size, positions, budget, 3-per-club), captain selection, transfer hit
 arithmetic, and chip availability windows. They run against live cached data,
 so they double as an assertion that the API still matches RULES.md — if FPL
