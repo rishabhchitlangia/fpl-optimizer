@@ -208,6 +208,57 @@ def _news_section(bootstrap: dict, selection: SquadSelection,
       </section>"""
 
 
+def _transfer_section(plans: list, free_transfers: int) -> str:
+    """Render the transfer ladder, showing what each extra transfer buys.
+
+    The point of showing every rung rather than only the best one is that the
+    marginal transfer is the decision. A second transfer gaining 2 points gross
+    is a bad idea at -4 and an obvious one if it is free.
+    """
+    if not plans:
+        return """
+      <section class="transfers">
+        <h2>Transfers</h2>
+        <p class="pin-help">
+          Press <strong>Suggest transfers</strong> to see what the model would
+          do with your squad this week, costed against your free transfers.
+        </p>
+      </section>"""
+
+    rows = []
+    for plan in plans[:6]:
+        if plan.n_transfers == 0:
+            moves = "<em>No transfers — roll it</em>"
+        else:
+            moves = "<br>".join(
+                f"{html.escape(m.out_name)} &rarr; <strong>{html.escape(m.in_name)}</strong>"
+                for m in plan.moves
+            )
+        hit = f"-{plan.hit_cost:.0f}" if plan.hit_cost else "—"
+        css = "delta-up" if plan.net_gain > 0 else "delta-down"
+        rows.append(f"""
+          <tr>
+            <td class="num">{plan.n_transfers}</td>
+            <td>{moves}</td>
+            <td class="num">{plan.gross_gain:+.2f}</td>
+            <td class="num">{hit}</td>
+            <td class="num {css}"><strong>{plan.net_gain:+.2f}</strong></td>
+          </tr>""")
+
+    return f"""
+      <section class="transfers">
+        <h2>Transfers — {free_transfers} free this week</h2>
+        <div class="table-scroll">
+          <table class="ladder">
+            <thead>
+              <tr><th>#</th><th>Moves</th><th>Gross</th><th>Hit</th><th>Net</th></tr>
+            </thead>
+            <tbody>{''.join(rows)}</tbody>
+          </table>
+        </div>
+      </section>"""
+
+
 def _pin_section(bootstrap: dict, required: set[int],
                  projections: dict[int, Projection]) -> str:
     """Render the must-include control: a search box plus the current pins."""
@@ -815,6 +866,54 @@ def _styles() -> str:
     }
     .news-more[open] summary { margin-bottom: 8px; }
 
+    /* --- Transfer ladder -------------------------------------------------- */
+
+    .transfers {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px 16px;
+    }
+    .transfers h2 {
+      font-family: "Barlow", sans-serif;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin: 0 0 10px;
+    }
+    .table-scroll { overflow-x: auto; }
+    .ladder {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+      font-variant-numeric: tabular-nums;
+    }
+    .ladder th {
+      text-align: left;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+      color: var(--muted);
+      padding: 0 10px 7px 0;
+      border-bottom: 1px solid var(--line);
+      white-space: nowrap;
+    }
+    .ladder td {
+      padding: 9px 10px 9px 0;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+    .ladder tr:last-child td { border-bottom: none; }
+    .ladder .num {
+      font-family: "IBM Plex Mono", monospace;
+      text-align: right;
+      white-space: nowrap;
+    }
+    .ladder em { color: var(--muted); font-style: normal; }
+
     /* --- Must include ---------------------------------------------------- */
 
     .pin-help { margin: 0 0 10px; font-size: 13px; color: var(--muted); }
@@ -948,6 +1047,13 @@ def _script() -> str:
         var revert = document.getElementById('revert');
         if (revert) { revert.addEventListener('click', function () { post([], true); }); }
 
+        var suggest = document.getElementById('suggest');
+        if (suggest) {
+          suggest.addEventListener('click', function () {
+            send({ action: 'suggest' });
+          });
+        }
+
         var pinAdd = document.getElementById('pin-add');
         if (pinAdd) { pinAdd.addEventListener('click', pinPlayer); }
 
@@ -1047,7 +1153,10 @@ def render_squad_html(selection: SquadSelection, bootstrap: dict,
                       interactive: bool = False,
                       changes: list[dict] | None = None,
                       baseline_points: float | None = None,
-                      required: set[int] | None = None) -> str:
+                      required: set[int] | None = None,
+                      owned_squad: bool = False,
+                      transfer_plans: list | None = None,
+                      free_transfers: int = 1) -> str:
     """Render a squad selection as an HTML pitch view.
 
     Args:
@@ -1064,6 +1173,12 @@ def render_squad_html(selection: SquadSelection, bootstrap: dict,
         baseline_points: Projected points before those swaps, for the delta.
         required: Players pinned into the squad, marked on the pitch and listed
             in the must-include section.
+        owned_squad: Whether this is the manager's own squad rather than a
+            from-scratch optimum. Changes the framing throughout: swaps become
+            transfers with a points cost.
+        transfer_plans: Ranked plans from :mod:`fpl.transfers`, rendered as a
+            ladder so the cost of each extra transfer is visible.
+        free_transfers: Free transfers available, for the hit arithmetic.
 
     Returns:
         HTML source.
@@ -1103,13 +1218,18 @@ def render_squad_html(selection: SquadSelection, bootstrap: dict,
 
     controls_html = ""
     if interactive:
-        controls_html = """
+        suggest_button = ""
+        if owned_squad:
+            suggest_button = ('<button type="button" class="btn btn--primary" '
+                              'id="suggest">Suggest transfers</button>')
+        controls_html = f"""
       <section class="controls">
         <div class="controls-text" id="controls-text">
           Click any player to swap them out.
         </div>
         <button type="button" class="btn" id="reset" disabled>Clear</button>
         <button type="button" class="btn" id="revert">Reset squad</button>
+        {suggest_button}
         <button type="button" class="btn btn--primary" id="reoptimise" disabled>
           Replace player
         </button>
@@ -1135,7 +1255,8 @@ def render_squad_html(selection: SquadSelection, bootstrap: dict,
             total = (f'<div class="change-row">Squad total '
                      f'<span class="{css}">{difference:+.2f}</span> '
                      f'against the original.</div>')
-        changes_html = (f'<section class="changes"><h2>Changes applied</h2>'
+        heading = "Transfers from your squad" if owned_squad else "Changes applied"
+        changes_html = (f'<section class="changes"><h2>{heading}</h2>'
                         f'{"".join(rows)}{total}</section>')
 
     script_html = f"<script>{_script()}</script>" if interactive else ""
@@ -1150,6 +1271,8 @@ def render_squad_html(selection: SquadSelection, bootstrap: dict,
 
     news_html = _news_section(bootstrap, selection, deadline_time)
     pins_html = _pin_section(bootstrap, required, projections) if interactive else ""
+    transfers_html = (_transfer_section(transfer_plans or [], free_transfers)
+                      if interactive and owned_squad else "")
 
     body = f"""
     <div class="wrap">
@@ -1190,6 +1313,7 @@ def render_squad_html(selection: SquadSelection, bootstrap: dict,
       </section>
 
       {news_html}
+      {transfers_html}
       {pins_html}
 
       <section class="bench">

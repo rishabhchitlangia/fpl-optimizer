@@ -31,7 +31,7 @@ from pathlib import Path
 
 from fpl import chips as chips_module
 from fpl import dixon_coles
-from fpl import data, optimizer, scoring, server, transfers, visualize
+from fpl import data, optimizer, planner, scoring, server, transfers, visualize
 
 console = Console()
 
@@ -107,6 +107,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-availability", type=float, default=0.0,
         help="Exclude players below this availability, 0.0-1.0. Use 1.0 to "
              "avoid every doubtful player.",
+    )
+    parser.add_argument(
+        "--plan", nargs="?", type=int, const=5, default=None, metavar="N",
+        help="Plan transfers across the next N gameweeks at once, instead of "
+             "optimising this week in isolation. Requires --team-id. "
+             "Defaults to 5 gameweeks.",
     )
     parser.add_argument(
         "--serve", nargs="?", type=int, const=8000, default=None,
@@ -276,6 +282,33 @@ def render_transfer_plans(plans, bootstrap: dict, free_transfers: int) -> Table:
             f"{plan.gross_gain:+.2f}",
             f"-{plan.hit_cost:.0f}" if plan.hit_cost else "—",
             f"[{net_style}]{plan.net_gain:+.2f}[/{net_style}]",
+        )
+    return table
+
+
+def render_plan(path, bootstrap: dict) -> Table:
+    """Render a multi-gameweek transfer path."""
+    table = Table(title=f"Transfer plan — {len(path.gameweeks)} gameweeks",
+                  title_style="bold", header_style="bold cyan", padding=(0, 1))
+    table.add_column("GW", justify="right", width=3)
+    table.add_column("FT", justify="right", width=2)
+    table.add_column("Moves", width=34)
+    table.add_column("Hit", justify="right", width=4)
+    table.add_column("Captain", width=12)
+    table.add_column("xPts", justify="right", width=6)
+
+    for row in planner.describe_path(path, bootstrap):
+        hit = f"-{row['hits']:.0f}" if row["hits"] else "—"
+        moves = row["moves"]
+        style = "dim" if moves == "—" else None
+        table.add_row(
+            str(row["gameweek"]),
+            str(row["free"]),
+            moves if moves != "—" else "[dim]roll the transfer[/dim]",
+            hit,
+            row["captain"][:12],
+            f"{row['points']:.2f}",
+            style=style,
         )
     return table
 
@@ -523,21 +556,78 @@ def main(argv: list[str] | None = None) -> int:
     )
     console.print(render_chips(flags))
 
+    if args.plan is not None:
+        if not current:
+            console.print(
+                "[yellow]Transfer planning needs your current squad — pass "
+                "--team-id (and note that no squad exists before GW1 is "
+                "played).[/yellow]\n"
+            )
+        else:
+            plan_gws = list(range(gameweek, min(gameweek + args.plan, 39)))
+            plan_projections = scorer.project(plan_gws)
+            owned_ids = [p for p in current.player_ids if p in players]
+            prices = transfers.build_selling_prices(current, players)
+            try:
+                with console.status(
+                        f"Planning {len(plan_gws)} gameweeks (this can take a "
+                        f"minute)..."):
+                    path = planner.plan_transfers(
+                        bootstrap, plan_projections, owned_ids, plan_gws,
+                        free_transfers=args.free_transfers,
+                        bank=current.bank,
+                        selling_prices=prices,
+                        locked=locked, banned=banned,
+                    )
+            except optimizer.OptimizerError as exc:
+                console.print(f"[red]Could not build a transfer plan:[/red] {exc}")
+                return 1
+
+            console.print(render_plan(path, bootstrap))
+            console.print(
+                f"Across {len(plan_gws)} gameweeks: "
+                f"[bold]{path.total_points:.1f}[/bold] points, "
+                f"[bold]-{path.total_hits:.0f}[/bold] in hits, "
+                f"net [bold green]{path.net_points:.1f}[/bold green]\n"
+                f"[dim]Considered {path.pool_size} candidate players. Prices are "
+                f"held fixed and chips are not planned — see planner.py.[/dim]\n"
+            )
+
     if args.serve is not None:
         deadline = next((e["deadline_time"] for e in bootstrap["events"]
                          if e["id"] == gameweek), None)
+
+        # With a team ID the editor opens on *your* squad, so the changes it
+        # shows are transfers you would actually make. Without one it opens on
+        # the from-scratch optimum, which is the right default for planning a
+        # new season or a wildcard.
+        editor_baseline = ideal
+        title = "Squad Editor"
+        if current:
+            owned_ids = [p for p in current.player_ids if p in players]
+            try:
+                editor_baseline = optimizer.pick_starting_xi(
+                    owned_ids, players, projections, data.position_lookup(bootstrap))
+                title = "My Squad"
+            except optimizer.OptimizerError as exc:
+                console.print(f"[yellow]Could not read your squad ({exc}); "
+                              f"opening the optimal squad instead.[/yellow]")
+                current = None
+
         editor = server.SquadEditor(
-            bootstrap, projections, ideal,
+            bootstrap, projections, editor_baseline,
             visualize.PitchMeta(
                 gameweek=gameweek,
                 horizon=len(horizon),
                 model=sample.model if sample else scorer.name,
                 deadline=(deadline or "").replace("T", " ").replace("Z", " UTC") or None,
                 gameweek_shape=shape["label"],
-                title="Squad Editor",
+                title=title,
             ),
             budget=budget,
             min_availability=args.min_availability,
+            owned=current,
+            free_transfers=args.free_transfers,
         )
         console.print(
             f"\n[green]Squad editor running at[/green] "

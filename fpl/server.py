@@ -31,6 +31,12 @@ from typing import Sequence
 from fpl import visualize
 from fpl.optimizer import OptimizerError, SquadSelection, optimize_squad
 from fpl.scoring import Projection
+from fpl.transfers import (
+    CurrentSquad,
+    best_plan,
+    build_selling_prices,
+    evaluate_transfer_plans,
+)
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +58,9 @@ class SquadEditor:
     def __init__(self, bootstrap: dict, projections: dict[int, Projection],
                  baseline: SquadSelection, meta: visualize.PitchMeta,
                  budget: int | None = None,
-                 min_availability: float = 0.0) -> None:
+                 min_availability: float = 0.0,
+                 owned: CurrentSquad | None = None,
+                 free_transfers: int = 1) -> None:
         self.bootstrap = bootstrap
         self.projections = projections
         self.baseline = baseline
@@ -60,6 +68,11 @@ class SquadEditor:
         self.meta = meta
         self.budget = budget
         self.min_availability = min_availability
+        # When a real squad is supplied the editor is showing *your* team, and
+        # changes are transfers with a points cost rather than a free rebuild.
+        self.owned = owned
+        self.free_transfers = free_transfers
+        self.last_plans: list = []
         self.banned: set[int] = set()
         self.required: set[int] = set()
         self._lock = threading.Lock()
@@ -156,6 +169,36 @@ class SquadEditor:
             self.current = selection
             return selection
 
+    @property
+    def is_owned_squad(self) -> bool:
+        """Whether the editor is showing the manager's own squad."""
+        return self.owned is not None
+
+    def suggest_transfers(self) -> SquadSelection:
+        """Apply the best transfer plan available under the free-transfer count.
+
+        Only meaningful for an owned squad. Unlike :meth:`require` and
+        :meth:`replace`, this respects the -4 point hit per extra transfer, so
+        it answers "what should I actually do this week" rather than "what is
+        the best squad in the abstract".
+        """
+        if self.owned is None:
+            raise OptimizerError("No squad supplied — pass --team-id to use this.")
+
+        with self._lock:
+            plans = evaluate_transfer_plans(
+                self.bootstrap,
+                self.projections,
+                self.owned,
+                free_transfers=self.free_transfers,
+                locked=sorted(self.required),
+                banned=sorted(self.banned),
+            )
+            self.last_plans = plans
+            chosen = best_plan(plans)
+            self.current = chosen.selection
+            return self.current
+
     def changes(self) -> list[dict]:
         """Return the swaps from the baseline squad to the current one.
 
@@ -191,6 +234,9 @@ class SquadEditor:
             changes=self.changes(),
             baseline_points=self.baseline.predicted_points,
             required=self.required,
+            owned_squad=self.is_owned_squad,
+            transfer_plans=self.last_plans,
+            free_transfers=self.free_transfers,
         )
 
     def render_page(self) -> str:
@@ -201,6 +247,9 @@ class SquadEditor:
             changes=self.changes(),
             baseline_points=self.baseline.predicted_points,
             required=self.required,
+            owned_squad=self.is_owned_squad,
+            transfer_plans=self.last_plans,
+            free_transfers=self.free_transfers,
         )
 
     def body_only(self) -> str:
@@ -270,6 +319,8 @@ def _handler_factory(editor: SquadEditor):
                     editor.require(require)
                 elif action == "unrequire":
                     editor.unrequire([int(x) for x in payload.get("unrequire", [])])
+                elif action == "suggest":
+                    editor.suggest_transfers()
                 else:
                     replace = [int(x) for x in payload.get("replace", [])]
                     keep = [int(x) for x in payload.get("keep", [])]

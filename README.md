@@ -143,6 +143,7 @@ That comparison is the whole point.
 | `--ban` | — | Exclude a player. Repeatable |
 | `--max-ownership` | — | Only pick players below this ownership %. Differential mode |
 | `--min-availability` | `0.0` | Drop players below this fitness. `1.0` avoids all doubts |
+| `--plan` | — | Plan N gameweeks at once (needs `--team-id`). Default 5 |
 | `--serve` | — | Open an interactive pitch for swapping players (port 8000) |
 | `--replace` | — | Swap a player out and re-optimise. Repeatable |
 | `--html` | — | Also write an HTML pitch view to this path |
@@ -193,6 +194,23 @@ Pins and rejections are opposites of the same idea, so the newer instruction
 wins: pinning someone you previously rejected clears the rejection, and
 rejecting someone you previously pinned clears the pin.
 
+**Opening on your own squad.** With `--team-id` the editor opens on *your*
+team rather than the from-scratch optimum, so the changes it shows are transfers
+you would actually make:
+
+```bash
+python main.py --serve --team-id 1234567 --free-transfers 2
+```
+
+A **Suggest transfers** button appears, which applies the best plan available
+under your free-transfer count — respecting the −4 hits, unlike pinning and
+replacing, which ignore them. Below the pitch, a ladder shows what each
+additional transfer would buy you and what it costs, so the marginal decision is
+visible rather than hidden inside a recommendation.
+
+Without a team ID it opens on the optimal squad, which is the right default for
+planning a new season or a wildcard.
+
 **Team news** sits below the pitch: any flagged player in your squad first,
 then the most-owned flagged players elsewhere, so you don't transfer into an
 injury. It reads the same parsed news the model scores with, so the panel and
@@ -206,6 +224,46 @@ For the same thing without a browser:
 ```bash
 python main.py --replace Haaland --replace Raya
 ```
+
+### Planning several gameweeks at once
+
+The weekly optimizer answers "what is the best squad this week". That is not how
+FPL is actually played — the skill is in the sequence:
+
+```bash
+python main.py --team-id 1234567 --plan 5
+```
+
+This solves **one program across the whole horizon** rather than a chain of
+greedy weekly decisions, so it can do things a weekly optimizer structurally
+cannot:
+
+```
+ GW  FT  Moves                              Hit  Captain   xPts
+  1   1  Calvert-Lewin → Haaland             —   Haaland  56.43
+  2   1  Zubimendi → E.Le Fée                —   Haaland  55.38
+  3   1  roll the transfer                   —   Haaland  55.69
+  4   2  E.Le Fée → Rice · Watkins → C-Lewin —   Haaland  55.73
+  5   1  Truffert → Guéhi                    —   Haaland  57.35
+```
+
+Note gameweek 3: it makes **no transfer at all**, banks it, and spends two in
+gameweek 4 — taking zero hits across five weeks. A week-by-week optimizer takes
+the best move available each week and never sees that.
+
+Free transfers accumulate under the game's own rules (one per week, banked to
+five, −4 beyond), modelled as a linear recursion inside the program.
+
+Three simplifications, all deliberate and all reported in the output:
+
+- **Prices are held fixed.** Modelling changes would make the budget depend on
+  the plan itself, and the 50% sell-on fee halves a rise's value anyway.
+- **Chips are not planned.** Wildcards and Free Hits change the transfer rules
+  entirely, and the blank/double calendar is not knowable this far ahead.
+  `chips.py` still flags them week to week.
+- **The candidate pool is pruned** to the current squad plus the best few dozen
+  per position — every player at every gameweek would be tens of thousands of
+  binaries. The pool size is printed so the approximation is never silent.
 
 ### Seeing the team on a pitch
 
@@ -468,8 +526,9 @@ fpl/
   news.py         Parses FPL player news into per-fixture availability
   visualize.py    HTML pitch view of a squad
   server.py       Local server for the interactive squad editor
+  planner.py      Multi-gameweek transfer planning (multi-period MILP)
 main.py           CLI
-tests/            141 tests, live data + simulated seasons + live server
+tests/            159 tests, live data + simulated seasons + live server
 RULES.md          Researched 2026/27 rules, with citations
 data/cache/       Cached API responses (gitignored)
 ```
@@ -482,7 +541,7 @@ data/cache/       Cached API responses (gitignored)
 python -m unittest discover -s tests -v
 ```
 
-141 tests covering the sell-on fee, formation enumeration, squad legality
+159 tests covering the sell-on fee, formation enumeration, squad legality
 (size, positions, budget, 3-per-club), captain selection, transfer hit
 arithmetic, and chip availability windows. They run against live cached data,
 so they double as an assertion that the API still matches RULES.md — if FPL
