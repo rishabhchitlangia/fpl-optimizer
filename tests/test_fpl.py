@@ -599,3 +599,54 @@ class TestChips(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestCurrentSeasonIsUsed(unittest.TestCase):
+    """The projection must see the season in progress, not only finished ones.
+
+    Regression: the rate model read ``history_past`` alone, so four gameweeks
+    into a season every player was still projected purely from last year.
+    """
+
+    def _summary(self, current_points, current_minutes, past_points, past_minutes):
+        return {
+            "history": [{"minutes": current_minutes, "total_points": current_points,
+                         "starts": 1, "expected_goal_involvements": "0.5"}],
+            "history_past": [{"minutes": past_minutes, "total_points": past_points,
+                              "starts": 30, "expected_goal_involvements": "10.0"}],
+        }
+
+    def test_current_season_moves_the_rate(self):
+        summary = self._summary(20, 90, 100, 3000)
+        without = scoring.historical_rates(summary, include_current=False)
+        with_now = scoring.historical_rates(summary, include_current=True)
+        self.assertGreater(with_now.weighted_points / with_now.weighted_90s,
+                           without.weighted_points / without.weighted_90s)
+
+    def test_a_player_with_only_this_season_is_not_blank(self):
+        """A debutant has no past seasons but is not therefore worthless."""
+        summary = {"history": [{"minutes": 90, "total_points": 8, "starts": 1}],
+                   "history_past": []}
+        rates = scoring.historical_rates(summary)
+        self.assertGreater(rates.weighted_90s, 0.0)
+        self.assertGreater(rates.weighted_points, 0.0)
+
+    def test_current_season_is_weighted_by_matches_played(self):
+        """One gameweek must not outweigh a full prior season."""
+        one_game = scoring.historical_rates(self._summary(2, 90, 200, 3000))
+        self.assertLess(one_game.weighted_games, 38)
+
+    def test_live_data_actually_reaches_the_model(self):
+        bootstrap = data.get_bootstrap()
+        summaries = data.get_all_element_summaries(
+            [e["id"] for e in bootstrap["elements"]])
+        played = [s for s in summaries.values() if s.get("history")]
+        if not played:
+            self.skipTest("season has not started")
+        moved = 0
+        for summary in list(played)[:120]:
+            a = scoring.historical_rates(summary, include_current=False)
+            b_ = scoring.historical_rates(summary, include_current=True)
+            if abs(a.weighted_points - b_.weighted_points) > 1e-9:
+                moved += 1
+        self.assertGreater(moved, 0, "current-season data is being ignored")

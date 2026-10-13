@@ -142,14 +142,36 @@ class TestRequiredPlayers(EditorTestCase):
         self.assertIn(haaland, editor.required)
 
     def test_pinning_an_expensive_player_restructures_the_squad(self):
-        """The rest must be free to change — that is what affording him means."""
+        """The rest must be free to change — that is what affording him means.
+
+        Pins the priciest player the baseline does NOT already hold. Pinning one
+        it does hold is a no-op by definition, which is correct behaviour but
+        proves nothing — an earlier version of this test pinned Haaland and
+        started failing the moment he became part of the optimum.
+        """
         editor = self.make_editor()
-        haaland = self._find("Haaland")
-        result = editor.require([haaland])
+        absent = sorted(
+            (p for p in self.bootstrap["elements"]
+             if p["id"] not in set(self.baseline.squad_ids)
+             and p.get("can_select") is not False),
+            key=lambda p: -p["now_cost"],
+        )
+        self.assertTrue(absent, "every player is already in the squad?")
+        target = absent[0]["id"]
+
+        result = editor.require([target])
+        self.assertIn(target, result.squad_ids)
         changed = set(self.baseline.squad_ids) - set(result.squad_ids)
         self.assertGreater(len(changed), 0)
         self.assertLessEqual(
             sum(self.players[p]["now_cost"] for p in result.squad_ids), 1000)
+
+    def test_pinning_a_player_already_held_is_a_no_op(self):
+        """The case the old test accidentally relied on, asserted properly."""
+        editor = self.make_editor()
+        held = self.baseline.squad_ids[0]
+        result = editor.require([held])
+        self.assertEqual(set(result.squad_ids), set(self.baseline.squad_ids))
 
     def test_pinning_costs_points_but_stays_legal(self):
         editor = self.make_editor()

@@ -470,28 +470,61 @@ class HistoricalRates:
         )
 
 
-def historical_rates(summary: dict | None, decay: float = SEASON_DECAY) -> HistoricalRates:
-    """Aggregate a player's ``history_past`` with geometric recency weighting.
+def historical_rates(summary: dict | None, decay: float = SEASON_DECAY,
+                     include_current: bool = True) -> HistoricalRates:
+    """Aggregate a player's season history with geometric recency weighting.
 
-    ``history_past`` is ordered oldest-first, so the last entry is the most
-    recent season and receives weight 1.0, the one before ``decay``, and so on.
+    **The season in progress is included as the most recent season**, at full
+    weight, which demotes last season to ``decay`` and the one before to
+    ``decay**2``.
+
+    That inclusion is not a refinement, it is the difference between a model
+    that can see this season and one that cannot. Without it every player is
+    projected purely from campaigns that have already ended: someone who lost
+    his place in August keeps last season's rate indefinitely, and a player
+    breaking out this year is invisible until the season is over. The only
+    current-season signal reaching the projection was FPL's own ``ep_next``,
+    through :class:`BlendedScorer`, at whatever weight the blend gave it.
+
+    The season in progress is weighted by matches actually played rather than a
+    full 38, so four gameweeks of evidence counts as four gameweeks — enough to
+    move the estimate, not enough to erase three prior seasons.
 
     Args:
         summary: An ``element-summary`` payload, or ``None`` if unavailable.
         decay: Per-season geometric decay factor.
+        include_current: Fold in the season in progress. ``False`` reproduces
+            the historical-only estimate, which the tests use to show the
+            difference.
 
     Returns:
         Weighted aggregates; all-zero if there is no usable history.
     """
-    if not summary or not summary.get("history_past"):
+    if not summary:
         return HistoricalRates(0.0, 0.0, 0.0, 0.0, 0)
 
-    seasons = summary["history_past"]
+    seasons = summary.get("history_past") or []
+    current = (summary.get("history") or []) if include_current else []
+    if not seasons and not current:
+        return HistoricalRates(0.0, 0.0, 0.0, 0.0, 0)
+
     w90 = wpts = wstarts = wgames = 0.0
     per_season: list[float] = []
+    offset_base = 0
+
+    if current:
+        played = len(current)
+        minutes = float(sum(m.get("minutes") or 0 for m in current))
+        per_season.append(minutes / played if played else 0.0)
+        if minutes > 0:
+            w90 += minutes / 90.0
+            wpts += float(sum(m.get("total_points") or 0 for m in current))
+            wstarts += float(sum(m.get("starts") or 0 for m in current))
+            wgames += float(played)
+        offset_base = 1
 
     for offset, season in enumerate(reversed(seasons)):
-        weight = decay ** offset
+        weight = decay ** (offset + offset_base)
         minutes = float(season.get("minutes") or 0)
         # Recorded even when zero: a season sat out is information about the
         # mean, and skipping it here would silently inflate the average.
@@ -516,15 +549,34 @@ def historical_goal_involvement_per_90(summary: dict | None,
     since it is far less noisy than raw goals plus assists, and falls back to
     actual goals and assists for seasons predating the expected-stats feed.
     """
-    if not summary or not summary.get("history_past"):
+    if not summary:
+        return 0.0
+    if not summary.get("history_past") and not summary.get("history"):
         return 0.0
 
     weighted_involvement = weighted_90s = 0.0
-    for offset, season in enumerate(reversed(summary["history_past"])):
+    offset_base = 0
+
+    # Current season first and at full weight, for the same reason as
+    # historical_rates: otherwise this season is invisible to the model.
+    current = summary.get("history") or []
+    if current:
+        minutes = float(sum(m.get("minutes") or 0 for m in current))
+        if minutes > 0:
+            expected = sum(float(m.get("expected_goal_involvements") or 0)
+                           for m in current)
+            if expected <= 0:
+                expected = sum(float(m.get("goals_scored") or 0)
+                               + float(m.get("assists") or 0) for m in current)
+            weighted_involvement += expected
+            weighted_90s += minutes / 90.0
+        offset_base = 1
+
+    for offset, season in enumerate(reversed(summary.get("history_past") or [])):
         minutes = float(season.get("minutes") or 0)
         if minutes <= 0:
             continue
-        weight = decay ** offset
+        weight = decay ** (offset + offset_base)
         expected = season.get("expected_goal_involvements")
         if expected in (None, "", 0, "0.00"):
             involvement = (float(season.get("goals_scored") or 0)
