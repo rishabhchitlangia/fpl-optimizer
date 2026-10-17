@@ -144,6 +144,21 @@ PEAK_SEASON_DECAY = 0.8
 #: a player who once played every minute may not reclaim that role.
 PEAK_TRUST = 0.85
 
+#: Gameweeks of the current season after which it fully governs the minutes
+#: estimate. Minutes are a statement about a player's role *now*, and roles
+#: change between seasons far more than within one — so current-season
+#: involvement is trusted much faster for minutes than for scoring rate.
+MINUTES_CURRENT_SEASON_FULL_WEIGHT = 8.0
+
+#: Current-season gameweeks after which non-selection overrides a past peak.
+#: Below this the sample is too short to conclude anything from a quiet start.
+PEAK_OVERRIDE_MIN_GAMES = 4
+
+#: Fraction of their past peak a player must still be playing for that peak to
+#: be projected forward. A player at less than this is not being eased back in,
+#: he is out of the team, and his old level is not evidence about this week.
+PEAK_OVERRIDE_RATIO = 0.35
+
 #: Minutes a starter is assumed to play, allowing for substitutions.
 STARTER_MINUTES = 85.0
 
@@ -516,11 +531,16 @@ def historical_rates(summary: dict | None, decay: float = SEASON_DECAY,
         played = len(current)
         minutes = float(sum(m.get("minutes") or 0 for m in current))
         per_season.append(minutes / played if played else 0.0)
-        if minutes > 0:
-            w90 += minutes / 90.0
-            wpts += float(sum(m.get("total_points") or 0 for m in current))
-            wstarts += float(sum(m.get("starts") or 0 for m in current))
-            wgames += float(played)
+        w90 += minutes / 90.0
+        wpts += float(sum(m.get("total_points") or 0 for m in current))
+        wstarts += float(sum(m.get("starts") or 0 for m in current))
+        # Count the gameweeks whether or not he played them. Not playing is
+        # evidence, and the strongest kind available: a player with zero
+        # minutes across six gameweeks is not in the team, and must not look
+        # identical to a player about whom nothing is known. Skipping empty
+        # seasons here let such a player fall back to the price prior and be
+        # projected as a starter.
+        wgames += float(played)
         offset_base = 1
 
     for offset, season in enumerate(reversed(seasons)):
@@ -965,7 +985,29 @@ class BayesianRateScorer(PlayerScorer):
         peak = rates.peak_minutes_per_game()
         if self._is_new_signing(player):
             peak *= 0.8
+
+        # Current-season non-selection overrides the peak. The floor exists to
+        # rescue a fit player whose last season was wrecked by injury; it must
+        # not promote someone who simply is not being picked this year. Zero
+        # minutes across six gameweeks is not a lay-off to recover from.
+        summary = self.summaries.get(player["id"]) or {}
+        current = summary.get("history") or []
+        if len(current) >= PEAK_OVERRIDE_MIN_GAMES and peak > 0:
+            played_per_game = sum(m.get("minutes") or 0 for m in current) / len(current)
+            if played_per_game < peak * PEAK_OVERRIDE_RATIO:
+                peak = played_per_game
+
         minutes = max(shrunk, min(peak, STARTER_MINUTES))
+
+        # Weight toward what the player is actually doing this season. Six
+        # gameweeks of history is a short sample for a scoring rate but a loud
+        # one for a role: a keeper with three full prior seasons and zero
+        # minutes this year is a backup, and no amount of past service makes him
+        # likely to start on Saturday.
+        if current:
+            current_weight = min(1.0, len(current) / MINUTES_CURRENT_SEASON_FULL_WEIGHT)
+            current_mpg = sum(m.get("minutes") or 0 for m in current) / len(current)
+            minutes = current_weight * current_mpg + (1.0 - current_weight) * minutes
 
         # Ownership is applied as a FLOOR, never a ceiling, and only to minutes
         # -- never to the points rate. The asymmetry and the restriction are
