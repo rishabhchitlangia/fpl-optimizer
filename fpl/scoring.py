@@ -93,6 +93,19 @@ NEUTRAL_FDR = 3.0
 #: in :class:`BlendedScorer`.
 BLEND_HALF_LIFE_GWS = 6.0
 
+#: How much of a player's shortfall in involvement :class:`EPNextScorer` passes
+#: on as a discount. ``ep_next`` is FPL's own expected points and already
+#: carries *some* allowance for rotation, so discounting by the full observed
+#: shortfall would charge a player twice for the same risk. Less than 1.0
+#: leaves that partial allowance intact while still refusing to treat a
+#: 30-minute-a-game substitute as a nailed starter.
+EP_INVOLVEMENT_DISCOUNT = 0.75
+
+#: Gameweeks of the current season after which observed involvement is trusted
+#: in full. Below this it is scaled down -- two substitute appearances in two
+#: gameweeks is not yet proof of a bench role.
+EP_INVOLVEMENT_FULL_WEIGHT = 5.0
+
 #: Minutes last season required before a player informs the price->rate prior.
 PRIOR_FIT_MIN_MINUTES = 900
 
@@ -760,6 +773,13 @@ class EPNextScorer(PlayerScorer):
     ``ep_next`` is FPL's expected points for the *next* gameweek specifically,
     so applying it across a multi-gameweek horizon assumes the rate holds. The
     fixture multiplier and per-gameweek fixture count still vary properly.
+
+    One correction is applied on top. ``ep_next`` says nothing explicit about
+    minutes, and taken at face value it values a substitute who scored once
+    like a starter who scores at the same rate per game. Each player's figure
+    is therefore discounted by their observed involvement this season --
+    partially, because FPL's own number already allows for some rotation risk.
+    See :data:`EP_INVOLVEMENT_DISCOUNT`.
     """
 
     name = "ep_next"
@@ -767,11 +787,30 @@ class EPNextScorer(PlayerScorer):
     def __init__(self, bootstrap: dict, fixtures: Sequence[dict]) -> None:
         self.players = bootstrap["elements"]
         self.context = FixtureContext(fixtures)
+        from fpl.data import get_game_state
+        self.finished_gws = get_game_state(bootstrap).finished_gws
+
+    def _involvement(self, player: dict) -> float:
+        """How much of the available minutes this player has actually played.
+
+        Returns 1.0 when there is nothing to go on -- pre-season, or a player
+        with no recorded minutes in a season not yet under way -- so the
+        discount only ever fires on evidence.
+        """
+        if self.finished_gws <= 0:
+            return 1.0
+        available = 90.0 * self.finished_gws
+        played = min(float(player.get("minutes") or 0), available)
+        share = played / available
+        confidence = min(1.0, self.finished_gws / EP_INVOLVEMENT_FULL_WEIGHT)
+        strength = EP_INVOLVEMENT_DISCOUNT * confidence
+        return 1.0 - strength * (1.0 - share)
 
     def project(self, gameweeks: Sequence[int]) -> dict[int, Projection]:
         projections: dict[int, Projection] = {}
         for player in self.players:
-            base = float(player.get("ep_next") or 0.0)
+            involvement = self._involvement(player)
+            base = float(player.get("ep_next") or 0.0) * involvement
             first_availability: float | None = None
             per_gw: dict[int, float] = {}
             counts: dict[int, int] = {}
@@ -800,7 +839,7 @@ class EPNextScorer(PlayerScorer):
                 per_gameweek=per_gw,
                 fixtures_per_gameweek=counts,
                 points_per_90=base,
-                expected_minutes=90.0 * avail,
+                expected_minutes=90.0 * avail * involvement,
                 availability=avail,
                 model=self.name,
             )
@@ -1203,15 +1242,24 @@ def build_scorer(bootstrap: dict, fixtures: Sequence[dict],
     if model != "auto":
         raise ValueError(f"Unknown model {model!r}")
 
-    # Auto: without history we have no choice; pre-season ep_next is useless, so
-    # go purely historical; thereafter blend current-season evidence in.
+    # Auto: with history, always the Bayesian model.
+    #
+    # Blending used to be the in-season default, on the reasoning that the
+    # Bayesian model was purely historical and needed current-season evidence
+    # mixed in. That reasoning no longer holds: the rate model reads this
+    # season's gameweeks directly and the fixture model is fitted on this
+    # season's results. Blending ``ep_next`` on top now does three harmful
+    # things -- it double-counts current-season form, it dilutes the
+    # Dixon-Coles fixture fit with raw FDR, and it drags every projection
+    # halfway toward a model that assumes a full 90 minutes for everyone.
+    #
+    # That last point is the damaging one. A rotation player with one big
+    # haul gets a high ``ep_next``, which the blend then multiplies by a
+    # nailed-starter minutes assumption, while an established player with an
+    # awkward next fixture gets marked down on a single gameweek's figure
+    # extrapolated across the whole horizon. ``--model blended`` is still
+    # there for comparison, but it is no longer what you get by default.
     if not summaries:
         log.warning("No player history available; falling back to ep_next.")
         return EPNextScorer(bootstrap, fixtures)
-    if not state.season_started:
-        return BayesianRateScorer(bootstrap, fixtures, summaries, fixture_model)
-    return BlendedScorer(
-        BayesianRateScorer(bootstrap, fixtures, summaries, fixture_model),
-        EPNextScorer(bootstrap, fixtures),
-        state.finished_gws,
-    )
+    return BayesianRateScorer(bootstrap, fixtures, summaries, fixture_model)

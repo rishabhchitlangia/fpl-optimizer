@@ -650,3 +650,152 @@ class TestCurrentSeasonIsUsed(unittest.TestCase):
             if abs(a.weighted_points - b_.weighted_points) > 1e-9:
                 moved += 1
         self.assertGreater(moved, 0, "current-season data is being ignored")
+
+
+class TestBanningAnOwnedPlayerReleasesHisValue(unittest.TestCase):
+    """Selling a banned player must fund his replacement.
+
+    Regression: ``banned`` drops a player from the candidate pool, and the
+    budget constraint raised sale proceeds only over candidates. An owned
+    player who was banned was therefore forced out with his money confiscated,
+    so a straight one-for-one swap on an empty bank reported "Infeasible" and
+    larger plans paid for the replacement by selling someone expensive.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bootstrap = data.get_bootstrap()
+        cls.fixtures = data.get_fixtures()
+        cls.players = data.player_lookup(cls.bootstrap)
+        summaries = data.get_all_element_summaries(list(cls.players))
+        scorer = scoring.build_scorer(cls.bootstrap, cls.fixtures, summaries, "bayes")
+        cls.gw = data.target_gameweek(cls.bootstrap)
+        cls.projections = scorer.project([cls.gw])
+        # A squad that spends everything, so the replacement can only be funded
+        # out of the banned player's sale.
+        cls.squad = optimizer.optimize_squad(cls.bootstrap, cls.projections)
+
+    def _expensive_defender(self) -> int:
+        defenders = [pid for pid in self.squad.squad_ids
+                     if self.players[pid]["element_type"] == 2]
+        return max(defenders, key=lambda pid: self.players[pid]["now_cost"])
+
+    def test_one_for_one_swap_is_feasible_on_an_empty_bank(self):
+        banned = self._expensive_defender()
+        selection = optimizer.optimize_squad(
+            self.bootstrap, self.projections,
+            current_squad=list(self.squad.squad_ids), bank=0,
+            max_transfers=1, apply_hits=False, banned=[banned],
+        )
+        self.assertEqual(selection.transfers_out, [banned])
+        self.assertEqual(len(selection.transfers_in), 1)
+
+    def test_a_second_transfer_never_makes_the_plan_worse(self):
+        """More freedom cannot hurt, so the ladder must not go backwards.
+
+        This is the sharpest signature of the bug: with the proceeds
+        confiscated, the two-transfer plan funded the replacement by selling
+        the squad's most expensive player, and so scored *below* the plan that
+        made a single swap.
+        """
+        banned = self._expensive_defender()
+        ladder = []
+        for cap in (1, 2, 3):
+            selection = optimizer.optimize_squad(
+                self.bootstrap, self.projections,
+                current_squad=list(self.squad.squad_ids), bank=0,
+                max_transfers=cap, apply_hits=False, banned=[banned],
+            )
+            self.assertIn(banned, selection.transfers_out)
+            ladder.append(selection.predicted_points)
+        for cap, (fewer, more) in enumerate(zip(ladder, ladder[1:]), start=1):
+            self.assertGreaterEqual(more, fewer - 1e-6,
+                                    msg=f"{cap + 1} transfers scored below {cap}")
+
+    def test_replacement_is_affordable_at_the_banned_price(self):
+        banned = self._expensive_defender()
+        selection = optimizer.optimize_squad(
+            self.bootstrap, self.projections,
+            current_squad=list(self.squad.squad_ids), bank=0,
+            max_transfers=1, apply_hits=False, banned=[banned],
+        )
+        incoming = selection.transfers_in[0]
+        self.assertLessEqual(self.players[incoming]["now_cost"],
+                             self.players[banned]["now_cost"])
+
+
+class TestModelSelection(unittest.TestCase):
+    """``auto`` must not dilute the rate model with a minutes-blind one.
+
+    Regression: blending ``ep_next`` in-season halved the minutes model's
+    discount, so a substitute with one big haul outranked an established
+    starter whose next fixture happened to be awkward.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bootstrap = data.get_bootstrap()
+        cls.fixtures = data.get_fixtures()
+        players = data.player_lookup(cls.bootstrap)
+        cls.summaries = data.get_all_element_summaries(list(players))
+
+    def test_auto_is_the_rate_model_when_history_is_available(self):
+        scorer = scoring.build_scorer(
+            self.bootstrap, self.fixtures, self.summaries, "auto")
+        self.assertIsInstance(scorer, scoring.BayesianRateScorer)
+
+    def test_auto_falls_back_to_ep_next_without_history(self):
+        scorer = scoring.build_scorer(self.bootstrap, self.fixtures, {}, "auto")
+        self.assertIsInstance(scorer, scoring.EPNextScorer)
+
+    def test_blended_is_still_available_on_request(self):
+        scorer = scoring.build_scorer(
+            self.bootstrap, self.fixtures, self.summaries, "blended")
+        self.assertIsInstance(scorer, scoring.BlendedScorer)
+
+
+class TestEPNextDiscountsRotation(unittest.TestCase):
+    """``ep_next`` says nothing about minutes, so involvement is applied.
+
+    Taken at face value it values a substitute who scored once like a starter
+    scoring at the same rate per game, which is what inflated cheap bench
+    players when the blended model was the in-season default.
+    """
+
+    def setUp(self):
+        self.bootstrap = data.get_bootstrap()
+        self.fixtures = data.get_fixtures()
+        self.scorer = scoring.EPNextScorer(self.bootstrap, self.fixtures)
+        self.finished = data.get_game_state(self.bootstrap).finished_gws
+
+    def test_involvement_is_neutral_without_evidence(self):
+        self.scorer.finished_gws = 0
+        self.assertAlmostEqual(self.scorer._involvement({"minutes": 0}), 1.0)
+
+    def test_a_nailed_starter_keeps_his_figure(self):
+        if not self.finished:
+            self.skipTest("season has not started")
+        nailed = {"minutes": 90 * self.finished}
+        self.assertAlmostEqual(self.scorer._involvement(nailed), 1.0)
+
+    def test_a_substitute_is_discounted(self):
+        if self.finished < scoring.EP_INVOLVEMENT_FULL_WEIGHT:
+            self.skipTest("too early for involvement to carry full weight")
+        bench = {"minutes": 20 * self.finished}
+        factor = self.scorer._involvement(bench)
+        self.assertLess(factor, 1.0)
+        # Partial, not total: FPL's own figure already allows for some risk.
+        self.assertGreater(factor, 1.0 - scoring.EP_INVOLVEMENT_DISCOUNT - 1e-9)
+
+    def test_the_discount_reaches_the_projection(self):
+        if self.finished < scoring.EP_INVOLVEMENT_FULL_WEIGHT:
+            self.skipTest("too early for involvement to carry full weight")
+        gw = data.target_gameweek(self.bootstrap)
+        projections = self.scorer.project([gw])
+        rotated = [e for e in self.bootstrap["elements"]
+                   if float(e.get("ep_next") or 0) > 2.0
+                   and 0 < (e.get("minutes") or 0) < 45 * self.finished]
+        if not rotated:
+            self.skipTest("no rotation player with a high ep_next")
+        player = rotated[0]
+        self.assertLess(projections[player["id"]].expected_minutes, 90.0)

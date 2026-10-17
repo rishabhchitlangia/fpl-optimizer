@@ -331,10 +331,22 @@ def optimize_squad(bootstrap: dict, projections: dict[int, Projection],
         # selling players we own, at their selling price (not their list price).
         incoming = pulp.lpSum(players[pid]["now_cost"] * in_squad[pid]
                               for pid in candidates if pid not in current)
-        raised = pulp.lpSum(selling_prices.get(pid, players[pid]["now_cost"])
-                            * (1 - in_squad[pid])
+
+        def sale_value(pid: int) -> int:
+            return selling_prices.get(pid, players[pid]["now_cost"])
+
+        raised = pulp.lpSum(sale_value(pid) * (1 - in_squad[pid])
                             for pid in candidates if pid in current)
-        problem += incoming <= bank + raised, "budget"
+        # Owned players kept out of the candidate pool -- banned, or no longer
+        # in the game -- are certain sales, so their proceeds are a constant
+        # rather than a term in the sum above. Leaving them out confiscated the
+        # money: banning a player you own forced him out and then refused to
+        # let you spend what he sold for, which made a straight one-for-one
+        # swap look infeasible and pushed the solver into dumping someone
+        # expensive to fund the replacement.
+        forced_out = sum(sale_value(pid) for pid in current
+                         if pid in players and pid not in in_squad)
+        problem += incoming <= bank + raised + forced_out, "budget"
     else:
         problem += (pulp.lpSum(players[pid]["now_cost"] * in_squad[pid]
                                for pid in candidates) <= budget, "budget")
