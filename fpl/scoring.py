@@ -157,6 +157,19 @@ PEAK_SEASON_DECAY = 0.8
 #: a player who once played every minute may not reclaim that role.
 PEAK_TRUST = 0.85
 
+#: Per-gameweek decay applied to current-season minutes, most recent first.
+#: 1.0 means every gameweek played counts equally, which is what the estimate
+#: did before it was measured: a player who started six then sat out three
+#: looked identical to one who sat out three then started six. Roles change
+#: mid-season and the recent weeks are the ones that describe the role now.
+#: Chosen at 0.7 against :mod:`fpl.backtest`, on rank correlation rather than
+#: the top-20 edge. Rank correlation improves monotonically as the decay falls
+#: and does so at every horizon tested (1, 3 and 5 gameweeks), so the ordering
+#: gain is real. The top-20 edge peaks nearer 0.5, but it bounces window to
+#: window and reverses at a one-gameweek horizon, so fitting to it would be
+#: reading noise. 0.7 wins on the stable metric without sitting on a cliff.
+MINUTES_RECENCY_DECAY = 0.7
+
 #: Gameweeks of the current season after which it fully governs the minutes
 #: estimate. Minutes are a statement about a player's role *now*, and roles
 #: change between seasons far more than within one — so current-season
@@ -496,6 +509,33 @@ class HistoricalRates:
             level * (PEAK_SEASON_DECAY ** age) * PEAK_TRUST
             for age, level in enumerate(self.minutes_per_game)
         )
+
+
+def recent_minutes_per_game(history: Sequence[dict],
+                           decay: float | None = None) -> float:
+    """Minutes per gameweek this season, weighting recent gameweeks higher.
+
+    A flat mean treats a player's September and his November the same. Roles
+    move within a season — a starter dropped a month ago, a squad player given
+    the shirt — and it is the recent weeks that say which he is now.
+
+    Args:
+        history: This season's per-gameweek entries, oldest first.
+        decay: Weight multiplier per gameweek going back. ``None`` uses
+            :data:`MINUTES_RECENCY_DECAY`; 1.0 reproduces the flat mean.
+
+    Returns:
+        Weighted mean minutes per gameweek, or 0.0 for an empty history.
+    """
+    if not history:
+        return 0.0
+    rate = MINUTES_RECENCY_DECAY if decay is None else decay
+    total = weight_sum = 0.0
+    for age, match in enumerate(reversed(history)):
+        weight = rate ** age
+        total += weight * float(match.get("minutes") or 0)
+        weight_sum += weight
+    return total / weight_sum if weight_sum else 0.0
 
 
 def historical_rates(summary: dict | None, decay: float = SEASON_DECAY,
@@ -1032,7 +1072,7 @@ class BayesianRateScorer(PlayerScorer):
         summary = self.summaries.get(player["id"]) or {}
         current = summary.get("history") or []
         if len(current) >= PEAK_OVERRIDE_MIN_GAMES and peak > 0:
-            played_per_game = sum(m.get("minutes") or 0 for m in current) / len(current)
+            played_per_game = recent_minutes_per_game(current)
             if played_per_game < peak * PEAK_OVERRIDE_RATIO:
                 peak = played_per_game
 
@@ -1045,7 +1085,7 @@ class BayesianRateScorer(PlayerScorer):
         # likely to start on Saturday.
         if current:
             current_weight = min(1.0, len(current) / MINUTES_CURRENT_SEASON_FULL_WEIGHT)
-            current_mpg = sum(m.get("minutes") or 0 for m in current) / len(current)
+            current_mpg = recent_minutes_per_game(current)
             minutes = current_weight * current_mpg + (1.0 - current_weight) * minutes
 
         # Ownership is applied as a FLOOR, never a ceiling, and only to minutes

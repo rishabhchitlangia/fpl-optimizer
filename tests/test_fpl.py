@@ -95,16 +95,56 @@ class TestNewSignings(unittest.TestCase):
         self.assertFalse(self.scorer._is_new_signing({"team_join_date": "2023-08-01"}))
         self.assertFalse(self.scorer._is_new_signing({}))
 
+    def _candidate_without_current_season(self):
+        """A player with a prior-season record but no games yet this season.
+
+        The discount only has anything to act on before the new club's own
+        minutes are observable. Once a signing has played a month, his
+        minutes at *this* club are the evidence and the old ones stop
+        mattering -- so the test has to pose the question at the point the
+        discount exists to answer, not in November.
+        """
+        for player in self.bootstrap["elements"]:
+            summary = self.scorer.summaries.get(player["id"]) or {}
+            if not (summary.get("history_past") or []):
+                continue
+            rates = scoring.historical_rates(summary)
+            if rates.weighted_games <= 0:
+                continue
+            if player["now_cost"] < 55:
+                continue
+            blanked = dict(summary, history=[])
+            self.scorer.summaries[player["id"]] = blanked
+            return dict(player)
+        return None
+
     def test_new_signing_status_changes_the_estimate(self):
         """Join date must actually feed through to projected minutes."""
-        candidate = next(
-            dict(p) for p in self.bootstrap["elements"]
-            if float(p["selected_by_percent"] or 0) < 3.0 and p["now_cost"] >= 55
-        )
+        candidate = self._candidate_without_current_season()
+        self.assertIsNotNone(candidate, "no player with a prior-season record")
         settled = dict(candidate, team_join_date="2022-07-01")
         moved = dict(candidate, team_join_date="2026-07-01")
         self.assertNotAlmostEqual(self.scorer._expected_minutes(moved),
                                   self.scorer._expected_minutes(settled))
+
+    def test_observed_minutes_override_the_signing_discount(self):
+        """A signing who has played here is judged on that, not his join date.
+
+        Regression guard in the other direction: the backtest showed the
+        current season should take over the minutes estimate quickly, and
+        once it has, the join date must stop moving the number.
+        """
+        candidate = next(
+            dict(p) for p in self.bootstrap["elements"]
+            if (self.scorer.summaries.get(p["id"]) or {}).get("history")
+        )
+        history = self.scorer.summaries[candidate["id"]]["history"]
+        if len(history) < scoring.MINUTES_CURRENT_SEASON_FULL_WEIGHT:
+            self.skipTest("too early in the season for the override to apply")
+        settled = dict(candidate, team_join_date="2022-07-01")
+        moved = dict(candidate, team_join_date="2026-07-01")
+        self.assertAlmostEqual(self.scorer._expected_minutes(moved),
+                               self.scorer._expected_minutes(settled))
 
     def test_a_proven_starter_who_moves_is_projected_down(self):
         """Minutes earned elsewhere are real but weaker evidence.
@@ -115,11 +155,17 @@ class TestNewSignings(unittest.TestCase):
         """
         proven = None
         for player in self.bootstrap["elements"]:
-            rates = scoring.historical_rates(self.scorer.summaries.get(player["id"]))
+            summary = self.scorer.summaries.get(player["id"]) or {}
+            if not (summary.get("history_past") or []):
+                continue
+            rates = scoring.historical_rates(dict(summary, history=[]))
             if rates.weighted_games <= 0:
                 continue
             observed = rates.weighted_minutes / rates.weighted_games
             if observed > 80 and float(player["selected_by_percent"] or 0) < 5:
+                # Pose the question before this season's minutes exist, which
+                # is the only point at which the discount can apply.
+                self.scorer.summaries[player["id"]] = dict(summary, history=[])
                 proven = player
                 break
         self.assertIsNotNone(proven, "no near-ever-present low-owned player found")
@@ -799,3 +845,83 @@ class TestEPNextDiscountsRotation(unittest.TestCase):
             self.skipTest("no rotation player with a high ep_next")
         player = rotated[0]
         self.assertLess(projections[player["id"]].expected_minutes, 90.0)
+
+
+class TestRecentMinutes(unittest.TestCase):
+    """Current-season minutes are weighted toward the recent gameweeks."""
+
+    def _history(self, minutes):
+        return [{"minutes": m, "total_points": 0, "round": i + 1}
+                for i, m in enumerate(minutes)]
+
+    def test_decay_of_one_is_the_flat_mean(self):
+        h = self._history([90, 0, 45])
+        self.assertAlmostEqual(scoring.recent_minutes_per_game(h, 1.0), 45.0)
+
+    def test_recent_gameweeks_dominate(self):
+        """A starter who has been dropped reads lower than his season mean."""
+        dropped = self._history([90] * 6 + [0, 45, 35])
+        flat = scoring.recent_minutes_per_game(dropped, 1.0)
+        weighted = scoring.recent_minutes_per_game(dropped, 0.7)
+        self.assertLess(weighted, flat)
+
+    def test_it_works_the_other_way_too(self):
+        """A squad player who won the shirt reads higher than his mean."""
+        promoted = self._history([0, 0, 0, 20, 45, 90, 90, 90])
+        flat = scoring.recent_minutes_per_game(promoted, 1.0)
+        weighted = scoring.recent_minutes_per_game(promoted, 0.7)
+        self.assertGreater(weighted, flat)
+
+    def test_empty_history_is_zero(self):
+        self.assertEqual(scoring.recent_minutes_per_game([]), 0.0)
+
+    def test_order_matters(self):
+        """The same minutes in the opposite order must not read the same."""
+        rising = self._history([0, 0, 90, 90])
+        falling = self._history([90, 90, 0, 0])
+        self.assertGreater(scoring.recent_minutes_per_game(rising, 0.7),
+                           scoring.recent_minutes_per_game(falling, 0.7))
+
+
+class TestObjectiveIsReported(unittest.TestCase):
+    """The solver's own objective is exposed, because the XI is not it.
+
+    Regression: plans were ranked on ``predicted_points`` (XI only) while the
+    solver maximised XI plus the bench at BENCH_WEIGHT. Adding a constraint
+    could then appear to improve a squad.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bootstrap = data.get_bootstrap()
+        cls.fixtures = data.get_fixtures()
+        players = data.player_lookup(cls.bootstrap)
+        summaries = data.get_all_element_summaries(list(players))
+        scorer = scoring.build_scorer(cls.bootstrap, cls.fixtures, summaries, "bayes")
+        cls.projections = scorer.project([data.target_gameweek(cls.bootstrap)])
+
+    def test_optimize_squad_reports_its_objective(self):
+        selection = optimizer.optimize_squad(self.bootstrap, self.projections)
+        self.assertIsNotNone(selection.objective_value)
+
+    def test_objective_exceeds_the_xi_because_the_bench_counts(self):
+        selection = optimizer.optimize_squad(self.bootstrap, self.projections)
+        self.assertGreater(selection.objective_value, selection.predicted_points)
+
+    def test_pick_starting_xi_reports_no_objective(self):
+        """Nothing was solved, so there is no objective to report."""
+        selection = optimizer.optimize_squad(self.bootstrap, self.projections)
+        redone = optimizer.pick_starting_xi(
+            selection.squad_ids, data.player_lookup(self.bootstrap),
+            self.projections, {t["id"]: t for t in self.bootstrap["element_types"]})
+        self.assertIsNone(redone.objective_value)
+
+    def test_a_constraint_never_improves_the_objective(self):
+        base = optimizer.optimize_squad(self.bootstrap, self.projections)
+        players = data.player_lookup(self.bootstrap)
+        absent = max((p for p in self.bootstrap["elements"]
+                      if p["id"] not in set(base.squad_ids)),
+                     key=lambda p: p["now_cost"])
+        pinned = optimizer.optimize_squad(
+            self.bootstrap, self.projections, locked=[absent["id"]])
+        self.assertLessEqual(pinned.objective_value, base.objective_value + 1e-6)

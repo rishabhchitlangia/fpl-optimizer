@@ -63,6 +63,18 @@ class SquadSelection:
         transfers_out: IDs leaving the current squad, if one was supplied.
         transfers_in: IDs joining the squad, if one was supplied.
         transfer_hits: Points deducted for exceeding free transfers.
+        objective_value: What the solver actually maximised -- the XI with the
+            captain doubled, *plus* the bench at :data:`BENCH_WEIGHT`. Set only
+            by :func:`optimize_squad`; ``None`` from :func:`pick_starting_xi`,
+            which does not solve anything.
+
+            Compare squads on this, not on ``predicted_points``. They are
+            different quantities, and the difference is not cosmetic: a squad
+            can score higher on ``predicted_points`` while being worse by the
+            measure the solver optimised, by trading bench strength for XI
+            strength. Ranking plans by ``predicted_points`` therefore produces
+            contradictions -- adding a constraint can appear to *improve* the
+            squad -- and flatters plans that hollow out the bench.
     """
 
     squad_ids: list[int]
@@ -76,6 +88,7 @@ class SquadSelection:
     transfers_out: list[int] = field(default_factory=list)
     transfers_in: list[int] = field(default_factory=list)
     transfer_hits: float = 0.0
+    objective_value: float | None = None
 
     @property
     def net_predicted_points(self) -> float:
@@ -357,7 +370,16 @@ def optimize_squad(bootstrap: dict, projections: dict[int, Projection],
             problem += in_squad[pid] == 1, f"locked_{pid}"
 
     # --- Solve ------------------------------------------------------------ #
-    status = problem.solve(pulp.PULP_CBC_CMD(msg=False))
+    # gapRel=0 demands a proven optimum. CBC's default relative gap stops as
+    # soon as it can prove it is within ~1% of the best possible, which on an
+    # objective of ~90 points is most of a point -- larger than many of the
+    # differences this tool reports between plans. Worse, the slack is not
+    # consistent: adding a constraint can narrow the search enough that CBC
+    # returns a *better* squad than the unconstrained solve, which makes
+    # pinning a player look free and comparisons between plans unreliable.
+    # These programs solve in well under a second, so the exact answer is
+    # affordable.
+    status = problem.solve(pulp.PULP_CBC_CMD(msg=False, gapRel=0))
     if pulp.LpStatus[status] != "Optimal":
         raise OptimizerError(
             f"No feasible squad found (solver status: {pulp.LpStatus[status]}). "
@@ -370,6 +392,8 @@ def optimize_squad(bootstrap: dict, projections: dict[int, Projection],
     # routing through pick_starting_xi guarantees the bench order and formation
     # string are produced by a single code path.
     selection = pick_starting_xi(chosen, players, projections, positions)
+
+    selection.objective_value = pulp.value(objective)
 
     if current:
         selection.transfers_out = sorted(current - set(chosen))

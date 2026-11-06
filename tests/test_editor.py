@@ -174,10 +174,22 @@ class TestRequiredPlayers(EditorTestCase):
         self.assertEqual(set(result.squad_ids), set(self.baseline.squad_ids))
 
     def test_pinning_costs_points_but_stays_legal(self):
+        """A constraint cannot improve the squad -- measured correctly.
+
+        This has to be asserted on ``objective_value``, not on
+        ``predicted_points``. The solver maximises the XI *plus* the bench at
+        BENCH_WEIGHT; ``predicted_points`` reports the XI alone. Pinning a
+        premium forward can push the solver into a squad with a stronger XI
+        and a hollowed-out bench, which raises ``predicted_points`` while
+        lowering the quantity actually being maximised. Asserting on the
+        reported number therefore fails on a correct solve.
+        """
         editor = self.make_editor()
         result = editor.require([self._find("Haaland")])
-        self.assertLessEqual(result.predicted_points,
-                             self.baseline.predicted_points + 1e-6)
+        self.assertIsNotNone(result.objective_value)
+        self.assertIsNotNone(self.baseline.objective_value)
+        self.assertLessEqual(result.objective_value,
+                             self.baseline.objective_value + 1e-6)
         counts: dict[int, int] = {}
         for pid in result.squad_ids:
             position = self.players[pid]["element_type"]
