@@ -360,7 +360,7 @@ def plan_transfers(bootstrap: dict, projections: dict[int, Projection],
     timed_out = elapsed >= time_limit * 0.95
     if timed_out:
         label = "Time limit"
-        log.warning("Transfer planning stopped on the %ds time limit; the plan "
+        log.warning("Transfer planning stopped on the %gs time limit; the plan "
                     "is the best found, not a proven optimum.", time_limit)
 
     if label not in ("Optimal", "Not Solved", "Time limit"):

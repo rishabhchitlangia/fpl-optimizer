@@ -516,6 +516,47 @@ Stated plainly, because they bound how far to trust the output:
 
 ---
 
+## How good the projections are
+
+Measured, not asserted:
+
+```bash
+python -m fpl.backtest
+```
+
+This rewinds the data to the end of each past gameweek — results, player
+history, prices, ownership — projects forward, and scores the projection
+against what happened. Figures for 2026/27 through gameweek 10:
+
+| Predicting the next gameweek | Rank correlation | Edge (pts/player/GW) |
+|---|---|---|
+| Rank by total points so far | 0.22 | +1.0 |
+| Rank by minutes played | 0.26 | +0.9 |
+| The model | 0.34 | +1.6 |
+
+*Edge* is how much the model's 20 highest-rated players outscored the average
+regular starter. Read these numbers before reading any projection:
+
+- **The signal is real but modest.** A single player's projection is typically
+  off by three to four points over a few gameweeks. Differences between two
+  plans smaller than about five points are not distinguishable.
+- **Minutes are the largest error.** With perfect knowledge of who plays, rank
+  correlation would roughly double. Confirmed line-ups are not in the API.
+- **Projections are calibrated for the next gameweek and still optimistic
+  further out.** A gap between two players is worth about 90% of what it says
+  for the coming gameweek and about 75% over three.
+- **Over three gameweeks the model ranks better but does not pick the top
+  better.** Rank correlation is 0.35 against 0.28 for minutes played, yet its
+  top-20 edge (+1.1) is no higher than that baseline's (+1.2) on the four
+  windows available.
+- **`ep_next` cannot be evaluated.** Its past values are not published, so
+  any backtest of it reads hindsight.
+
+The model was tuned on roughly 1,300 player-gameweeks from one season. That is
+enough to reject bad settings, not enough to trust fine ones.
+
+---
+
 ## Why the optimizer optimises the XI, not the squad
 
 Only 11 players score in a normal gameweek. Maximising the sum over all 15 will
@@ -543,8 +584,9 @@ fpl/
   visualize.py    HTML pitch view of a squad
   server.py       Local server for the interactive squad editor
   planner.py      Multi-gameweek transfer planning (multi-period MILP)
+  backtest.py     Point-in-time evaluation of the model against outcomes
 main.py           CLI
-tests/            162 tests, live data + simulated seasons + live server
+tests/            231 tests, live data + simulated seasons + live server
 RULES.md          Researched 2026/27 rules, with citations
 data/cache/       Cached API responses (gitignored)
 ```
@@ -557,7 +599,7 @@ data/cache/       Cached API responses (gitignored)
 python -m unittest discover -s tests -v
 ```
 
-162 tests covering the sell-on fee, formation enumeration, squad legality
+231 tests covering the sell-on fee, formation enumeration, squad legality
 (size, positions, budget, 3-per-club), captain selection, transfer hit
 arithmetic, and chip availability windows. They run against live cached data,
 so they double as an assertion that the API still matches RULES.md — if FPL

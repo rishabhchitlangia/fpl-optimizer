@@ -86,6 +86,56 @@ FIXTURE_BETA = {1: 0.25, 2: 0.25, 3: 0.18, 4: 0.18}
 #: 0.0 — they earn nothing from a clean sheet (RULES.md §2.1).
 POSITION_DEFENSIVE_SHARE = {1: 0.70, 2: 0.60, 3: 0.15, 4: 0.0}
 
+#: How much of the modelled fixture effect is passed through to a projection.
+#: At 1.0 the model swung a player's expected points by roughly +/-40% between
+#: his easiest and hardest fixtures. Measured against outcomes that was about
+#: twice too much: halving it raised next-gameweek rank correlation (0.287 to
+#: 0.304), moved the calibration slope from 0.58 toward 1 (0.73) and cut the
+#: over-prediction of the top tenth of players from 1.76 to 1.06 points a
+#: gameweek, with no loss of top-20 edge. Removing the effect entirely (0.0)
+#: cost edge, so fixtures do matter -- about half as much as first assumed.
+FIXTURE_STRENGTH = 0.5
+
+#: Points for a goal by position and for an assist (RULES.md section 2), used
+#: to convert expected goals and assists into expected points.
+GOAL_POINTS = {1: 10, 2: 6, 3: 5, 4: 4}
+ASSIST_POINTS = 3
+
+#: Weight on expected goals and assists, against the goals and assists that
+#: actually went in, when computing this season's scoring rate. Week to week
+#: a nailed player's points barely correlate with his previous week's (rank
+#: correlation 0.07): the goals themselves are mostly noise, the chances are
+#: not. 1.0 replaces actual with expected entirely, which beat 0.5 in the
+#: backtest on ranking and calibration at both horizons tested.
+UNDERLYING_WEIGHT = 1.0
+
+#: Shrinkage of each player's per-90 output toward the mean for his position,
+#: applied last. The uncalibrated model is over-dispersed: the players it
+#: rated highest scored well below their projection and the ones it rated
+#: lowest scored above theirs, so a projected 10-point gap between two players
+#: was really worth about 6. That matters most exactly where the numbers are
+#: used -- weighing a transfer against a 4-point hit. 1.0 disables it.
+#:
+#: Measured with :mod:`fpl.backtest` (``Result.slope``, where 1.0 is honest):
+#:
+#:     shrink   next-GW slope   top-tenth excess   3-GW slope
+#:      1.0         0.77            +1.09             0.64
+#:      0.7         0.91            +0.42             0.76
+#:      0.6         0.96            +0.24             0.80
+#:
+#: 0.7 takes most of the correction with no measurable loss of ranking or
+#: edge at either horizon; 0.6 calibrates the next gameweek almost exactly but
+#: starts to cost edge over three. Projections several gameweeks out stay
+#: over-dispersed whatever is chosen here, because that error comes from
+#: minutes -- injuries and dropped players -- which shrinking a scoring rate
+#: cannot repair. Multi-gameweek gains should still be read as optimistic by
+#: about a quarter.
+CALIBRATION_SHRINK = 0.7
+
+#: Expected minutes above which a player counts as a regular when computing
+#: the position mean that :data:`CALIBRATION_SHRINK` pulls toward.
+CALIBRATION_REGULAR_MINUTES = 45.0
+
 #: Neutral fixture difficulty. FDR runs 1 (easiest) to 5 (hardest).
 NEUTRAL_FDR = 3.0
 
@@ -162,13 +212,13 @@ PEAK_TRUST = 0.85
 #: did before it was measured: a player who started six then sat out three
 #: looked identical to one who sat out three then started six. Roles change
 #: mid-season and the recent weeks are the ones that describe the role now.
-#: Chosen at 0.7 against :mod:`fpl.backtest`, on rank correlation rather than
-#: the top-20 edge. Rank correlation improves monotonically as the decay falls
-#: and does so at every horizon tested (1, 3 and 5 gameweeks), so the ordering
-#: gain is real. The top-20 edge peaks nearer 0.5, but it bounces window to
-#: window and reverses at a one-gameweek horizon, so fitting to it would be
-#: reading noise. 0.7 wins on the stable metric without sitting on a cliff.
-MINUTES_RECENCY_DECAY = 0.7
+#: First set to 0.7 on a backtest that still leaked today's prices, ownership
+#: and injury flags into the past. Re-measured with those removed, 0.5 is
+#: better on rank correlation at both the one- and three-gameweek horizons
+#: (0.314 to 0.332 and 0.339 to 0.341 with the other fixes in place) and no
+#: worse on edge. 0.3 ranks the next gameweek better still but gives edge
+#: back, so it is not taken.
+MINUTES_RECENCY_DECAY = 0.5
 
 #: Gameweeks of the current season after which it fully governs the minutes
 #: estimate. Minutes are a statement about a player's role *now*, and roles
@@ -375,6 +425,12 @@ class FixtureModel:
     def multiplier(self, element_type: int, team_id: int,
                    fixture: "TeamFixture") -> float:
         """Return the scoring multiplier for a player in a fixture."""
+        return 1.0 + FIXTURE_STRENGTH * (
+            self._raw_multiplier(element_type, team_id, fixture) - 1.0)
+
+    def _raw_multiplier(self, element_type: int, team_id: int,
+                        fixture: "TeamFixture") -> float:
+        """The undamped fixture effect, before :data:`FIXTURE_STRENGTH`."""
         baseline = fixture_multiplier(fixture.difficulty, element_type)
         if not self.has_results_model:
             return baseline
@@ -538,8 +594,63 @@ def recent_minutes_per_game(history: Sequence[dict],
     return total / weight_sum if weight_sum else 0.0
 
 
-def historical_rates(summary: dict | None, decay: float = SEASON_DECAY,
-                     include_current: bool = True) -> HistoricalRates:
+def calibrated_rate(per_90: float, anchor: float | None,
+                    shrink: float | None = None) -> float:
+    """Pull a per-90 expectation toward its position's mean.
+
+    Args:
+        per_90: Expected points per 90 for one fixture, fixture effect included.
+        anchor: The position's mean rate among regulars, or ``None`` to leave
+            the value alone (no regulars to anchor on).
+        shrink: Fraction of the gap to the anchor that is kept. ``None`` uses
+            :data:`CALIBRATION_SHRINK`; 1.0 returns ``per_90`` unchanged.
+
+    Returns:
+        The calibrated per-90 expectation. Applied to the rate rather than to
+        the final points so that a player who will not play stays at zero
+        instead of being pulled up toward the mean.
+    """
+    if anchor is None:
+        return per_90
+    keep = CALIBRATION_SHRINK if shrink is None else shrink
+    return anchor + keep * (per_90 - anchor)
+
+
+def underlying_points(match: dict, element_type: int | None,
+                      weight: float | None = None) -> float:
+    """A match's points with goals and assists replaced by their expectation.
+
+    Everything else in the score -- appearance, clean sheet, saves, bonus,
+    cards -- is kept as it happened; only the goal and assist components move
+    from what went in to what the chances were worth.
+
+    Args:
+        match: One per-gameweek entry from ``element-summary`` ``history``.
+        element_type: Position ID, which sets the points per goal. ``None``
+            returns the actual points unchanged.
+        weight: 0.0 keeps actual points, 1.0 uses expected goals and assists
+            in full. ``None`` uses :data:`UNDERLYING_WEIGHT`.
+
+    Returns:
+        The adjusted points. Matches with no expected-stats data are returned
+        unadjusted rather than treated as zero chances.
+    """
+    points = float(match.get("total_points") or 0)
+    if element_type is None:
+        return points
+    xg, xa = match.get("expected_goals"), match.get("expected_assists")
+    if xg is None and xa is None:
+        return points
+    w = UNDERLYING_WEIGHT if weight is None else weight
+    goal_gap = float(xg or 0) - float(match.get("goals_scored") or 0)
+    assist_gap = float(xa or 0) - float(match.get("assists") or 0)
+    return points + w * (goal_gap * GOAL_POINTS.get(element_type, 5)
+                         + assist_gap * ASSIST_POINTS)
+
+
+def historical_rates(summary: dict | None, decay: float | None = None,
+                     include_current: bool = True,
+                     element_type: int | None = None) -> HistoricalRates:
     """Aggregate a player's season history with geometric recency weighting.
 
     **The season in progress is included as the most recent season**, at full
@@ -560,16 +671,22 @@ def historical_rates(summary: dict | None, decay: float = SEASON_DECAY,
 
     Args:
         summary: An ``element-summary`` payload, or ``None`` if unavailable.
-        decay: Per-season geometric decay factor.
+        decay: Per-season geometric decay factor. ``None`` reads
+            :data:`SEASON_DECAY` at call time -- as a default argument it was
+            frozen at import, so changing the constant silently did nothing.
         include_current: Fold in the season in progress. ``False`` reproduces
             the historical-only estimate, which the tests use to show the
             difference.
+        element_type: Position ID. When given, this season's points are
+            taken from :func:`underlying_points` rather than as scored.
 
     Returns:
         Weighted aggregates; all-zero if there is no usable history.
     """
     if not summary:
         return HistoricalRates(0.0, 0.0, 0.0, 0.0, 0)
+    if decay is None:
+        decay = SEASON_DECAY
 
     seasons = summary.get("history_past") or []
     current = (summary.get("history") or []) if include_current else []
@@ -585,7 +702,7 @@ def historical_rates(summary: dict | None, decay: float = SEASON_DECAY,
         minutes = float(sum(m.get("minutes") or 0 for m in current))
         per_season.append(minutes / played if played else 0.0)
         w90 += minutes / 90.0
-        wpts += float(sum(m.get("total_points") or 0 for m in current))
+        wpts += float(sum(underlying_points(m, element_type) for m in current))
         wstarts += float(sum(m.get("starts") or 0 for m in current))
         # Count the gameweeks whether or not he played them. Not playing is
         # evidence, and the strongest kind available: a player with zero
@@ -615,7 +732,7 @@ def historical_rates(summary: dict | None, decay: float = SEASON_DECAY,
 
 
 def historical_goal_involvement_per_90(summary: dict | None,
-                                       decay: float = SEASON_DECAY) -> float:
+                                       decay: float | None = None) -> float:
     """Return recency-weighted expected goal involvements per 90 minutes.
 
     Prefers FPL's own ``expected_goal_involvements`` (xG + xA) where recorded,
@@ -626,6 +743,8 @@ def historical_goal_involvement_per_90(summary: dict | None,
         return 0.0
     if not summary.get("history_past") and not summary.get("history"):
         return 0.0
+    if decay is None:
+        decay = SEASON_DECAY
 
     weighted_involvement = weighted_90s = 0.0
     offset_base = 0
@@ -970,7 +1089,8 @@ class BayesianRateScorer(PlayerScorer):
         set-piece orders are not exposed by the API and the change cannot be
         detected.
         """
-        rates = historical_rates(self.summaries.get(player["id"]))
+        rates = historical_rates(self.summaries.get(player["id"]),
+                                 element_type=player["element_type"])
         team = self.teams.get(player["team"], {})
         prior_rate = self.prior.rate_for(player) * team_strength_multiplier(team)
 
@@ -1110,15 +1230,37 @@ class BayesianRateScorer(PlayerScorer):
 
         return min(90.0, max(minutes, ownership_floor))
 
+    def _regular_rate_by_position(
+            self, estimates: dict[int, tuple[float, float]]) -> dict[int, float]:
+        """Mean per-90 rate of each position's regulars.
+
+        This is the point :func:`calibrated_rate` shrinks toward. It is taken
+        over players expected to play, because the squad players who make up
+        most of the list would otherwise drag the anchor down to a level no
+        pickable player sits at.
+        """
+        by_position: dict[int, list[float]] = {}
+        for player in self.players:
+            rate, minutes = estimates[player["id"]]
+            if minutes >= CALIBRATION_REGULAR_MINUTES:
+                by_position.setdefault(player["element_type"], []).append(rate)
+        return {position: sum(rates) / len(rates)
+                for position, rates in by_position.items() if rates}
+
     def project(self, gameweeks: Sequence[int]) -> dict[int, Projection]:
         projections: dict[int, Projection] = {}
         model_name = self.name
         if self.fixture_model.has_results_model:
             model_name = f"{self.name}+dixon-coles(w={self.fixture_model.weight:.2f})"
 
+        estimates = {player["id"]: (self._points_per_90(player),
+                                    self._expected_minutes(player))
+                     for player in self.players}
+        position_mean = self._regular_rate_by_position(estimates)
+
         for player in self.players:
-            rate = self._points_per_90(player)
-            minutes = self._expected_minutes(player)
+            rate, minutes = estimates[player["id"]]
+            anchor = position_mean.get(player["element_type"])
             involvement_rate = historical_goal_involvement_per_90(
                 self.summaries.get(player["id"]))
             first_availability: float | None = None
@@ -1144,11 +1286,10 @@ class BayesianRateScorer(PlayerScorer):
                     avail = availability(player, fixture.kickoff)
                     if first_availability is None:
                         first_availability = avail
-                    per_fixture = avail * (minutes / 90.0) * rate
-
                     multiplier = self.fixture_model.multiplier(
                         player["element_type"], player["team"], fixture)
-                    points += per_fixture * multiplier
+                    per_90 = calibrated_rate(rate * multiplier, anchor)
+                    points += avail * (minutes / 90.0) * per_90
 
                     goals = self.fixture_model.expected_goals(player["team"], fixture)
                     if goals is not None:

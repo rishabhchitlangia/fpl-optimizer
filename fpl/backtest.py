@@ -11,6 +11,16 @@ it is. :func:`rewind` strips both: per-player history after the cutoff, and
 the scores of fixtures played after it, so the fitted results model sees only
 matches that had finished at the time.
 
+The player list leaks too, less obviously. ``bootstrap-static`` carries today's
+price, today's ownership and today's injury flags, and all three have absorbed
+what happened after the cutoff: a player who scored heavily since has risen in
+price and been bought, and one injured last week is flagged as unavailable for
+matches he in fact played. :func:`rewind_bootstrap` restores price and
+ownership from the per-match record, which keeps both, and clears availability
+flags, which cannot be recovered. ``ep_next`` cannot be recovered either, so
+the ``ep_next`` and blended models cannot be evaluated here at all; an earlier
+run that tried reported a correlation of 0.78, all of it hindsight.
+
 Metrics
 -------
 Correlation and mean absolute error describe the fit over the whole player
@@ -78,6 +88,46 @@ def rewind(summaries: dict[int, dict], fixtures: Sequence[dict],
     return rewound_summaries, rewound_fixtures
 
 
+def rewind_bootstrap(bootstrap: dict, summaries: dict[int, dict],
+                     cutoff: int) -> dict:
+    """Return the player list as it stood once gameweek ``cutoff`` had finished.
+
+    Args:
+        bootstrap: Today's ``bootstrap-static`` payload.
+        summaries: Full ``element-summary`` payloads keyed by player ID.
+        cutoff: The last gameweek whose results are known.
+
+    Returns:
+        A copy in which each player's ``now_cost`` and ``selected_by_percent``
+        come from his last match on or before the cutoff, every player is
+        marked available, and ``ep_next`` is blanked. Players with no match by
+        the cutoff keep today's price, the best estimate available.
+    """
+    managers = float(bootstrap.get("total_players") or 0)
+    elements: list[dict] = []
+    for element in bootstrap.get("elements", []):
+        copy = dict(element)
+        played = [m for m in ((summaries.get(element["id"]) or {}).get("history") or [])
+                  if (m.get("round") or 0) <= cutoff]
+        if played:
+            last = played[-1]
+            if last.get("value"):
+                copy["now_cost"] = last["value"]
+            if managers and last.get("selected") is not None:
+                copy["selected_by_percent"] = str(
+                    round(100.0 * float(last["selected"]) / managers, 1))
+        copy["status"] = "a"
+        copy["news"] = ""
+        copy["chance_of_playing_next_round"] = None
+        copy["chance_of_playing_this_round"] = None
+        copy["ep_next"] = "0.0"
+        elements.append(copy)
+
+    rewound = dict(bootstrap)
+    rewound["elements"] = elements
+    return rewound
+
+
 def actual_points(summary: dict, gameweeks: Sequence[int]) -> float:
     """Points a player actually scored across ``gameweeks``."""
     wanted = set(gameweeks)
@@ -110,6 +160,14 @@ class Result:
         mae: Mean absolute error over the window, in points.
         top_n: Mean actual points per gameweek of the top-ranked players.
         pool_mean: Mean actual points per gameweek over the whole pool.
+        slope: Least-squares slope of outcome on prediction. 1.0 means a
+            predicted gap between two players is worth what it says; below 1
+            the model is over-dispersed and its gaps are exaggerated. Only
+            meaningful for predictors on the points scale -- a baseline that
+            ranks by minutes has a slope with no interpretation.
+        top_decile_excess: Mean prediction minus mean outcome, per gameweek,
+            over the highest-predicted tenth of the pool. Positive means the
+            players the model likes most are being over-sold.
     """
 
     cutoff: int
@@ -120,6 +178,8 @@ class Result:
     mae: float
     top_n: float
     pool_mean: float
+    slope: float = 0.0
+    top_decile_excess: float = 0.0
 
     @property
     def edge(self) -> float:
@@ -183,7 +243,16 @@ def evaluate(predictions: dict[int, float], summaries: dict[int, dict],
     predicted = [r[0] for r in rows]
     outcome = [r[1] for r in rows]
     weeks = len(targets)
-    best = sorted(rows, key=lambda r: -r[0])[:top_n]
+    ordered = sorted(rows, key=lambda r: -r[0])
+    best = ordered[:top_n]
+
+    mean_p, mean_a = statistics.mean(predicted), statistics.mean(outcome)
+    spread = sum((p - mean_p) ** 2 for p in predicted)
+    slope = (sum((p - mean_p) * (a - mean_a) for p, a in rows) / spread
+             if spread else 0.0)
+    decile = ordered[:max(1, len(ordered) // 10)]
+    excess = (statistics.mean(p for p, _ in decile)
+              - statistics.mean(a for _, a in decile)) / weeks
 
     return Result(
         cutoff=cutoff,
@@ -194,6 +263,8 @@ def evaluate(predictions: dict[int, float], summaries: dict[int, dict],
         mae=statistics.mean(abs(p - a) for p, a in rows),
         top_n=statistics.mean(a for _, a in best) / weeks,
         pool_mean=statistics.mean(outcome) / weeks,
+        slope=slope,
+        top_decile_excess=excess,
     )
 
 
@@ -210,8 +281,9 @@ def walk_forward(bootstrap: dict, fixtures: Sequence[dict],
         bootstrap: ``bootstrap-static`` payload.
         fixtures: Full fixture list.
         summaries: Full ``element-summary`` payloads.
-        predictor: Called with ``(bootstrap, rewound_fixtures, rewound_summaries,
-            targets)`` and returning predicted points per player ID.
+        predictor: Called with ``(rewound_bootstrap, rewound_fixtures,
+            rewound_summaries, targets)`` and returning predicted points per
+            player ID.
         cutoffs: Gameweeks to rewind to.
         horizon: How many gameweeks ahead to predict.
         last_gameweek: Highest gameweek with results. Inferred when omitted.
@@ -231,7 +303,8 @@ def walk_forward(bootstrap: dict, fixtures: Sequence[dict],
         if not targets:
             continue
         rewound_summaries, rewound_fixtures = rewind(summaries, fixtures, cutoff)
-        predictions = predictor(bootstrap, rewound_fixtures, rewound_summaries, targets)
+        predictions = predictor(rewind_bootstrap(bootstrap, summaries, cutoff),
+                                rewound_fixtures, rewound_summaries, targets)
         result = evaluate(predictions, summaries, cutoff, targets, top_n=top_n)
         if result:
             results.append(result)
@@ -239,7 +312,16 @@ def walk_forward(bootstrap: dict, fixtures: Sequence[dict],
 
 
 def model_predictor(model: str = "auto") -> Callable:
-    """A predictor backed by :func:`fpl.scoring.build_scorer`."""
+    """A predictor backed by :func:`fpl.scoring.build_scorer`.
+
+    Only the historical model can be evaluated. ``ep_next`` is blanked by
+    :func:`rewind_bootstrap` because its past values are not recoverable.
+    """
+    if model in ("ep_next", "blended"):
+        raise ValueError(
+            f"{model!r} cannot be backtested: ep_next is only published for "
+            "the coming gameweek, so any past evaluation would read hindsight.")
+
     def predict(bootstrap, fixtures, summaries, targets):
         scorer = scoring.build_scorer(bootstrap, fixtures, summaries, model)
         return {pid: p.expected_points
@@ -257,8 +339,8 @@ def baseline_predictor(kind: str) -> Callable:
     ``total``   — points scored so far. The one to beat.
     ``form``    — points per game over the last four gameweeks.
     ``minutes`` — minutes played; tests how much of the signal is just availability.
-    ``price``   — list price, i.e. what the game itself thinks a player is worth.
-    ``ep_next`` — FPL's own one-week expectation.
+    ``price``   — list price at the cutoff, i.e. what the game itself thought
+                  a player was worth.
     """
     def predict(bootstrap, fixtures, summaries, targets):
         players = {e["id"]: e for e in bootstrap["elements"]}
@@ -276,10 +358,58 @@ def baseline_predictor(kind: str) -> Callable:
                 value = _history_sum(summary, "minutes")
             elif kind == "price":
                 value = float(player.get("now_cost") or 0)
-            elif kind == "ep_next":
-                value = float(player.get("ep_next") or 0.0)
             else:
                 raise ValueError(f"Unknown baseline {kind!r}")
             out[pid] = value * len(targets)
         return out
     return predict
+
+
+def summarise(results: Sequence[Result]) -> dict[str, float]:
+    """Average a walk-forward run's windows into one row of headline figures."""
+    if not results:
+        return {}
+    return {
+        "rank": statistics.mean(r.rank_correlation for r in results),
+        "edge": statistics.mean(r.edge for r in results),
+        "slope": statistics.mean(r.slope for r in results),
+        "top_decile_excess": statistics.mean(r.top_decile_excess for r in results),
+        "mae": statistics.mean(r.mae for r in results),
+        "windows": float(len(results)),
+    }
+
+
+def main() -> int:
+    """Print the model against its baselines: ``python -m fpl.backtest``."""
+    from fpl import data
+
+    bootstrap = data.get_bootstrap()
+    fixtures = data.get_fixtures()
+    summaries = data.get_all_element_summaries(
+        [e["id"] for e in bootstrap["elements"]])
+    played = max(((m.get("round") or 0) for s in summaries.values()
+                  for m in (s.get("history") or [])), default=0)
+    if played < 5:
+        print("Not enough of the season has been played to backtest.")
+        return 1
+
+    for horizon in (1, 3):
+        cutoffs = list(range(4, played - horizon + 1))
+        print(f"\nHorizon {horizon} gameweek(s), cutoffs GW{cutoffs[0]}-GW{cutoffs[-1]}")
+        print(f"  {'predictor':18s} {'rank':>6} {'edge':>6} {'slope':>6} {'top-10% excess':>15}")
+        rows = [(f"baseline: {kind}", baseline_predictor(kind), False)
+                for kind in ("total", "form", "minutes", "price")]
+        rows.append(("the model", model_predictor("bayes"), True))
+        for label, predictor, on_points_scale in rows:
+            summary = summarise(walk_forward(bootstrap, fixtures, summaries,
+                                             predictor, cutoffs, horizon=horizon))
+            if not summary:
+                continue
+            calibration = (f"{summary['slope']:6.2f} {summary['top_decile_excess']:+15.2f}"
+                           if on_points_scale else f"{'-':>6} {'-':>15}")
+            print(f"  {label:18s} {summary['rank']:6.3f} {summary['edge']:+6.2f} {calibration}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

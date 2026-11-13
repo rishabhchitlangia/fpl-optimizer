@@ -163,3 +163,97 @@ class TestAgainstLiveData(unittest.TestCase):
             self.assertGreaterEqual(
                 model.rank_correlation, base.rank_correlation,
                 msg=f"the {kind!r} baseline out-ranks the model")
+
+
+class TestRewindBootstrap(unittest.TestCase):
+    """The player list must be rewound too: price, ownership, availability."""
+
+    def setUp(self):
+        self.bootstrap = {
+            "total_players": 1000,
+            "elements": [
+                {"id": 1, "now_cost": 80, "selected_by_percent": "40.0",
+                 "status": "i", "news": "Knee injury", "ep_next": "9.0",
+                 "chance_of_playing_next_round": 0},
+                {"id": 2, "now_cost": 45, "selected_by_percent": "1.0",
+                 "status": "a", "news": "", "ep_next": "2.0",
+                 "chance_of_playing_next_round": None},
+            ],
+        }
+        self.summaries = {
+            1: {"history": [
+                {"round": 3, "value": 70, "selected": 50, "minutes": 90},
+                {"round": 6, "value": 75, "selected": 200, "minutes": 90},
+                {"round": 9, "value": 80, "selected": 400, "minutes": 90}]},
+            2: {"history": []},
+        }
+
+    def _player(self, cutoff, pid=1):
+        rewound = backtest.rewind_bootstrap(self.bootstrap, self.summaries, cutoff)
+        return next(e for e in rewound["elements"] if e["id"] == pid)
+
+    def test_price_is_the_price_at_the_cutoff(self):
+        self.assertEqual(self._player(6)["now_cost"], 75)
+        self.assertEqual(self._player(4)["now_cost"], 70)
+
+    def test_ownership_is_the_ownership_at_the_cutoff(self):
+        self.assertEqual(self._player(6)["selected_by_percent"], "20.0")
+
+    def test_a_later_injury_is_not_applied_to_the_past(self):
+        player = self._player(6)
+        self.assertEqual(player["status"], "a")
+        self.assertEqual(player["news"], "")
+        self.assertIsNone(player["chance_of_playing_next_round"])
+
+    def test_ep_next_is_blanked(self):
+        self.assertEqual(float(self._player(6)["ep_next"]), 0.0)
+
+    def test_a_player_with_no_matches_keeps_his_price(self):
+        self.assertEqual(self._player(6, pid=2)["now_cost"], 45)
+
+    def test_the_original_is_not_mutated(self):
+        backtest.rewind_bootstrap(self.bootstrap, self.summaries, 6)
+        self.assertEqual(self.bootstrap["elements"][0]["now_cost"], 80)
+        self.assertEqual(self.bootstrap["elements"][0]["status"], "i")
+
+
+class TestCalibrationMetrics(unittest.TestCase):
+    """Slope and top-decile excess describe over-confidence."""
+
+    def _pool(self, pairs):
+        summaries, predictions = {}, {}
+        for i, (p, a) in enumerate(pairs):
+            summaries[i] = {"history": [{"round": 1, "minutes": 90, "total_points": 0},
+                                        {"round": 2, "minutes": 90, "total_points": a}]}
+            predictions[i] = p
+        return predictions, summaries
+
+    def test_an_honest_predictor_has_slope_one_and_no_excess(self):
+        predictions, summaries = self._pool([(float(i), float(i)) for i in range(40)])
+        result = backtest.evaluate(predictions, summaries, 1, [2], top_n=5)
+        self.assertAlmostEqual(result.slope, 1.0)
+        self.assertAlmostEqual(result.top_decile_excess, 0.0)
+
+    def test_an_exaggerating_predictor_has_slope_below_one(self):
+        """Right order, double the spread: every gap is half what it claims."""
+        predictions, summaries = self._pool([(2.0 * i, float(i)) for i in range(40)])
+        result = backtest.evaluate(predictions, summaries, 1, [2], top_n=5)
+        self.assertAlmostEqual(result.slope, 0.5)
+        self.assertGreater(result.top_decile_excess, 0.0)
+
+
+class TestWhatCannotBeBacktested(unittest.TestCase):
+    """ep_next has no recoverable history, so evaluating it must fail loudly."""
+
+    def test_ep_next_is_refused(self):
+        with self.assertRaises(ValueError):
+            backtest.model_predictor("ep_next")
+
+    def test_blended_is_refused(self):
+        with self.assertRaises(ValueError):
+            backtest.model_predictor("blended")
+
+    def test_the_ep_next_baseline_is_gone(self):
+        predictor = backtest.baseline_predictor("ep_next")
+        with self.assertRaises(ValueError):
+            predictor({"elements": []}, [], {1: {"history": []}}, [2])

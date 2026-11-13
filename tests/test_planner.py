@@ -197,10 +197,20 @@ class TestPlanQuality(PlannerTestCase):
         plan than a pruned one while reporting optimality, which is how this
         was found. Wall time is the only reliable signal.
         """
+        horizon = list(range(1, 9))
+        # The limit is set from how long this machine actually needs, not from
+        # a fixed number of seconds. A hard-coded two seconds held only while
+        # the solve was slower than that, and stopped holding the day the
+        # projections changed and the same program solved in 1.4.
+        full = planner.plan_transfers(
+            self.bootstrap, self.projections, self.squad, horizon,
+            free_transfers=1, bank=self.bank)
+        self.assertFalse(full.hit_time_limit)
+
         path = planner.plan_transfers(
-            self.bootstrap, self.projections, self.squad,
-            list(range(1, 9)), free_transfers=1, bank=self.bank,
-            time_limit=2)
+            self.bootstrap, self.projections, self.squad, horizon,
+            free_transfers=1, bank=self.bank,
+            time_limit=max(0.05, full.solve_seconds / 4.0))
         self.assertTrue(path.hit_time_limit)
         self.assertEqual(path.status, "Time limit")
 

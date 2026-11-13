@@ -925,3 +925,148 @@ class TestObjectiveIsReported(unittest.TestCase):
         pinned = optimizer.optimize_squad(
             self.bootstrap, self.projections, locked=[absent["id"]])
         self.assertLessEqual(pinned.objective_value, base.objective_value + 1e-6)
+
+
+class TestUnderlyingPoints(unittest.TestCase):
+    """This season's rate is built from chances, not from what went in."""
+
+    def _match(self, **over):
+        match = {"total_points": 2, "goals_scored": 0, "assists": 0,
+                 "expected_goals": "0.0", "expected_assists": "0.0", "minutes": 90}
+        match.update(over)
+        return match
+
+    def test_a_lucky_goal_is_marked_down(self):
+        """A forward who scored from 0.2 xG is credited with 0.2 of a goal."""
+        match = self._match(total_points=6, goals_scored=1, expected_goals="0.2")
+        self.assertAlmostEqual(scoring.underlying_points(match, 4, 1.0),
+                               6 - 0.8 * scoring.GOAL_POINTS[4])
+
+    def test_an_unlucky_blank_is_marked_up(self):
+        match = self._match(expected_goals="0.9", expected_assists="0.5")
+        expected = 2 + 0.9 * scoring.GOAL_POINTS[3] + 0.5 * scoring.ASSIST_POINTS
+        self.assertAlmostEqual(scoring.underlying_points(match, 3, 1.0), expected)
+
+    def test_zero_weight_returns_actual_points(self):
+        match = self._match(total_points=13, goals_scored=2, expected_goals="0.4")
+        self.assertAlmostEqual(scoring.underlying_points(match, 4, 0.0), 13.0)
+
+    def test_no_position_means_no_adjustment(self):
+        match = self._match(total_points=13, goals_scored=2, expected_goals="0.4")
+        self.assertAlmostEqual(scoring.underlying_points(match, None), 13.0)
+
+    def test_a_match_without_expected_stats_is_left_alone(self):
+        """Missing data is not the same as having created nothing."""
+        match = {"total_points": 8, "goals_scored": 1, "assists": 0, "minutes": 90}
+        self.assertAlmostEqual(scoring.underlying_points(match, 4, 1.0), 8.0)
+
+    def test_the_rate_uses_it_only_when_given_a_position(self):
+        summary = {"history": [self._match(total_points=10, goals_scored=2,
+                                           expected_goals="0.5")],
+                   "history_past": []}
+        as_scored = scoring.historical_rates(summary)
+        underlying = scoring.historical_rates(summary, element_type=4)
+        self.assertAlmostEqual(as_scored.weighted_points, 10.0)
+        self.assertLess(underlying.weighted_points, as_scored.weighted_points)
+        self.assertAlmostEqual(underlying.weighted_90s, as_scored.weighted_90s)
+
+
+class TestSeasonDecayIsReadAtCallTime(unittest.TestCase):
+    """Regression: the constant was frozen into a default argument at import."""
+
+    def setUp(self):
+        self.summary = {"history": [],
+                        "history_past": [
+                            {"minutes": 3000, "total_points": 100, "starts": 33},
+                            {"minutes": 3000, "total_points": 200, "starts": 33}]}
+        self._saved = scoring.SEASON_DECAY
+
+    def tearDown(self):
+        scoring.SEASON_DECAY = self._saved
+
+    def test_changing_the_constant_changes_the_estimate(self):
+        scoring.SEASON_DECAY = 0.9
+        gentle = scoring.historical_rates(self.summary)
+        scoring.SEASON_DECAY = 0.1
+        steep = scoring.historical_rates(self.summary)
+        # The older season scored half as much; a steeper decay trusts it less.
+        self.assertGreater(steep.weighted_points / steep.weighted_90s,
+                           gentle.weighted_points / gentle.weighted_90s)
+
+    def test_an_explicit_decay_still_wins(self):
+        scoring.SEASON_DECAY = 0.1
+        explicit = scoring.historical_rates(self.summary, decay=0.9)
+        scoring.SEASON_DECAY = 0.9
+        default = scoring.historical_rates(self.summary)
+        self.assertAlmostEqual(explicit.weighted_points, default.weighted_points)
+
+
+class TestCalibration(unittest.TestCase):
+    """Per-90 output is pulled toward the position mean, and only that."""
+
+    def test_full_weight_is_the_identity(self):
+        self.assertAlmostEqual(scoring.calibrated_rate(7.0, 4.0, 1.0), 7.0)
+
+    def test_a_high_rate_comes_down_and_a_low_one_goes_up(self):
+        self.assertLess(scoring.calibrated_rate(7.0, 4.0, 0.7), 7.0)
+        self.assertGreater(scoring.calibrated_rate(2.0, 4.0, 0.7), 2.0)
+
+    def test_order_is_preserved(self):
+        low, high = (scoring.calibrated_rate(v, 4.0, 0.7) for v in (5.0, 6.0))
+        self.assertLess(low, high)
+
+    def test_the_gap_between_two_players_shrinks_by_the_factor(self):
+        a, b_ = (scoring.calibrated_rate(v, 4.0, 0.7) for v in (5.0, 7.0))
+        self.assertAlmostEqual(b_ - a, 0.7 * 2.0)
+
+    def test_no_anchor_means_no_change(self):
+        self.assertAlmostEqual(scoring.calibrated_rate(7.0, None, 0.5), 7.0)
+
+    def test_a_player_who_will_not_play_stays_at_zero(self):
+        """Shrinking the rate, not the points, is what guarantees this."""
+        bootstrap = data.get_bootstrap()
+        fixtures = data.get_fixtures()
+        players = data.player_lookup(bootstrap)
+        summaries = data.get_all_element_summaries(list(players))
+        scorer = scoring.build_scorer(bootstrap, fixtures, summaries, "bayes")
+        projections = scorer.project([data.target_gameweek(bootstrap)])
+        idle = [p for p in projections.values() if p.expected_minutes == 0]
+        if not idle:
+            self.skipTest("every player has some expected minutes")
+        self.assertTrue(all(p.expected_points == 0 for p in idle))
+
+
+class TestFixtureStrength(unittest.TestCase):
+    """The fixture effect is damped, never reversed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bootstrap = data.get_bootstrap()
+        cls.fixtures = data.get_fixtures()
+        players = data.player_lookup(cls.bootstrap)
+        summaries = data.get_all_element_summaries(list(players))
+        cls.scorer = scoring.build_scorer(cls.bootstrap, cls.fixtures, summaries, "bayes")
+        cls.model = cls.scorer.fixture_model
+        gw = data.target_gameweek(cls.bootstrap)
+        cls.cases = [(team["id"], fixture)
+                     for team in cls.bootstrap["teams"]
+                     for fixture in cls.scorer.context.fixtures_for(team["id"], gw)]
+
+    def test_there_are_fixtures_to_check(self):
+        self.assertTrue(self.cases)
+
+    def test_damped_effect_is_the_stated_fraction_of_the_raw_one(self):
+        for team_id, fixture in self.cases:
+            for position in (1, 2, 3, 4):
+                raw = self.model._raw_multiplier(position, team_id, fixture)
+                damped = self.model.multiplier(position, team_id, fixture)
+                self.assertAlmostEqual(
+                    damped - 1.0, scoring.FIXTURE_STRENGTH * (raw - 1.0))
+
+    def test_a_good_fixture_is_still_better_than_a_bad_one(self):
+        raws = [(self.model._raw_multiplier(4, t, f), self.model.multiplier(4, t, f))
+                for t, f in self.cases]
+        best, worst = max(raws), min(raws)
+        if best[0] == worst[0]:
+            self.skipTest("no spread in fixture difficulty this gameweek")
+        self.assertGreater(best[1], worst[1])
